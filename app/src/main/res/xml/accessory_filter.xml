@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Пустой фильтр = любой аксессуар. Когда узнаете manufacturer/model ГУ из Logcat
+         (тег CarBridge/Service), сузьте фильтр, чтобы приложение не предлагалось для чужих устройств. -->
+    <usb-accessory />
+</resources>

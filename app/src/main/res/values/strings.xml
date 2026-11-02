@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">CarBridge Offline</string>
+    <string name="a11y_label">CarBridge Offline mirror touch</string>
+    <string name="a11y_desc">Передаёт касания с головного устройства на экран телефона.</string>
+</resources>

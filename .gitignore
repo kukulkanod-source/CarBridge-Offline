@@ -1,0 +1,24 @@
+# Local build and IDE files
+.gradle/
+.idea/
+**/build/
+local.properties
+*.iml
+.DS_Store
+Thumbs.db
+# Signing material and credentials
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+key.properties
+signing.properties
+.env
+.env.*
+# Session reports and distributed packages
+*.log
+*.log.bin
+*.apk
+*.aab

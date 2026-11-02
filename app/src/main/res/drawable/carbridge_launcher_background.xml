@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item><shape android:shape="rectangle"><solid android:color="#15191F" /></shape></item>
+    <!-- Keep the monogram within adaptive masks; the surrounding art extends beyond them. -->
+    <item android:left="16dp" android:top="16dp" android:right="16dp" android:bottom="16dp">
+        <bitmap android:src="@drawable/carbridge_launcher_art" android:gravity="fill" android:filter="true" />
+    </item>
+</layer-list>

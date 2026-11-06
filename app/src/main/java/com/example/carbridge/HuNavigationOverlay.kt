@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.location.LocationManager
 import android.media.AudioManager
@@ -53,6 +54,7 @@ class HuNavigationOverlay(
     private val onText: (String) -> Boolean,
     private val onInputKey: (Int) -> Unit,
     private val onNotificationOpen: (StatusBarNotification) -> Unit,
+    private val onNavigationCueVisibility: (Boolean) -> Unit = {},
 ) {
     private val context = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
@@ -69,16 +71,40 @@ class HuNavigationOverlay(
     private var navigationCueNotificationKey = ""
     private var navigationCueMissingAt = 0L
     private var navigationCueSignState = ""
+    private var cueVisible = false
+    private var navigationOnRight = true
+    private var navigationCardHeight = 0
+    private var navigationCardInset = 0
+    fun isNavigationCueVisible(): Boolean = cueVisible
+    private fun publishCueVisibility(visible: Boolean) {
+        if(cueVisible==visible) return
+        cueVisible=visible
+        onNavigationCueVisibility(visible)
+    }
+    fun setNavigationCardPlacement(right: Boolean, cardHeight: Int, inset: Int) {
+        navigationOnRight=right; navigationCardHeight=cardHeight; navigationCardInset=inset
+        navigationCue?.setPlacement(right,cardHeight,inset)
+        banner?.let { card ->
+            val params=card.layoutParams as? WindowManager.LayoutParams ?: return@let
+            val gravity=Gravity.TOP or if(right) Gravity.START else Gravity.END
+            if(params.gravity!=gravity) {
+                params.gravity=gravity
+                runCatching { manager?.updateViewLayout(card,params) }
+            }
+        }
+    }
     private val finishMissingNavigation = Runnable { renderNavigationCue(allowGrace = false) }
     private var phoneButton: ImageView? = null
     private var mediaButton: ImageView? = null
     private var statusButton: Button? = null
+    private var batteryIcon: ImageView? = null
     private var dock: LinearLayout? = null
     private var notificationIcons: LinearLayout? = null
     private var connectionIcons: LinearLayout? = null
     private var appMenu: LinearLayout? = null
     private var phoneVisible = false
     private var mediaVisible = false
+    private var resizeForMusic = true
     private var displayId = -1
     private var density = 1f
     private var barHeight = 0
@@ -161,11 +187,13 @@ class HuNavigationOverlay(
         }
     }
 
-    fun show(id: Int, interfaceDpi: Int = 200, outputWidth: Int = 0, hideAutomatically: Boolean = false): Boolean {
+    fun show(id: Int, interfaceDpi: Int = 200, outputWidth: Int = 0, hideAutomatically: Boolean = false,
+        resizeForMusic: Boolean = true): Boolean {
         if (id <= 0 || !Settings.canDrawOverlays(context)) return false
-        if (displayId == id && view != null) return true
+        if (displayId == id && view != null && this.resizeForMusic == resizeForMusic) return true
         close()
         autoHide = hideAutomatically
+        this.resizeForMusic = resizeForMusic
         val display = context.getSystemService(DisplayManager::class.java).getDisplay(id)
             ?.takeIf { it.isValid } ?: return false
         return try {
@@ -190,7 +218,11 @@ class HuNavigationOverlay(
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(px(6), px(3), px(6), px(3))
-                setBackgroundColor(Color.rgb(17, 23, 32))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(17, 23, 32))
+                    cornerRadius = px(10).toFloat()
+                }
+                clipToOutline = true
             }
             fun section() = LinearLayout(wc).apply { gravity = Gravity.CENTER_VERTICAL }.also {
                 root.addView(it, LinearLayout.LayoutParams(0, -1, 1f))
@@ -203,12 +235,13 @@ class HuNavigationOverlay(
                     contentDescription = description
                     scaleType = ImageView.ScaleType.CENTER_INSIDE
                     setPadding(px(8), px(4), px(8), px(4))
-                    setImageDrawable(HuStatusIcon(kind, Color.rgb(137, 198, 255)))
+                    setImageDrawable(HuPanelIcons.drawable(context, kind))
                     setOnClickListener { action() }
                 }.also { controls.addView(it, LinearLayout.LayoutParams(0, -1, 1f)) }
             control("back", "Назад", onBack)
             control("home", "Домой", onHome)
             control("apps", "Все приложения", onApps)
+            control("favorites", "Избранные приложения") { favorites?.open() }
             mediaButton = control("music", "Музыка / карта", onMediaToggle)
             phoneButton = control("phone_off", "Экран телефона") {
                 if (phoneVisible) onPhoneDim() else onPhoneWake()
@@ -224,19 +257,32 @@ class HuNavigationOverlay(
             }.also { root.addView(it, LinearLayout.LayoutParams(0, -1, 1f)) }
             divider()
             val statusGroup = section()
-            notificationIcons = LinearLayout(wc).apply { gravity = Gravity.CENTER_VERTICAL }
-                .also { statusGroup.addView(it, LinearLayout.LayoutParams(px(44), -1)) }
+            notificationIcons = LinearLayout(wc).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                setOnClickListener { toggleShade() }
+                addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
+                    if (right - left != oldRight - oldLeft) main.post {
+                        if (view != null) renderStatus()
+                    }
+                }
+            }.also { statusGroup.addView(it, LinearLayout.LayoutParams(0, -1, 1f)) }
             connectionIcons = LinearLayout(wc).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                gravity = Gravity.END or Gravity.CENTER_VERTICAL
                 setOnClickListener { toggleShade() }
-            }.also { statusGroup.addView(it, LinearLayout.LayoutParams(0, -1, 1f)) }
+            }.also { statusGroup.addView(it, LinearLayout.LayoutParams(-2, -1)) }
+            batteryIcon = ImageView(wc).apply {
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                setPadding(px(2), px(3), px(2), px(3))
+                setOnClickListener { toggleShade() }
+            }.also { statusGroup.addView(it, LinearLayout.LayoutParams(px(26), px(24))) }
             statusButton = button("", "Подключения, уведомления и быстрые настройки") { toggleShade() }
-                .apply { setTextSize(TypedValue.COMPLEX_UNIT_PX, 14f * density); maxLines = 1 }
-                .also { statusGroup.addView(it, LinearLayout.LayoutParams(px(95), -1)) }
+                .apply { setTextSize(TypedValue.COMPLEX_UNIT_PX, 13f * density); maxLines = 1 }
+                .also { statusGroup.addView(it, LinearLayout.LayoutParams(px(76), -1)) }
             wm.addView(root, layout(width, barHeight, Gravity.BOTTOM))
             view = root
-            favorites = HuFavoritesPanel(wc, wm, width, height, barHeight, density, onLaunch, { dismissApplications() }).also { it.showHandle() }
+            favorites = HuFavoritesPanel(wc, wm, width, height, barHeight, density, onLaunch, { dismissApplications() })
             if (autoHide) {
                 val edge = View(wc).apply {
                     setBackgroundColor(Color.rgb(107, 183, 245))
@@ -388,14 +434,14 @@ class HuNavigationOverlay(
         val cm = context.getSystemService(ConnectivityManager::class.java)
         val caps = cm.allNetworks.mapNotNull { cm.getNetworkCapabilities(it) }
         val bt = runCatching { context.getSystemService(BluetoothManager::class.java).adapter?.isEnabled == true }.getOrDefault(false)
-        val location = runCatching { context.getSystemService(LocationManager::class.java).isLocationEnabled }.getOrDefault(false)
         connectionIcons?.let { row ->
             row.removeAllViews()
             fun add(kind: String, description: String) {
                 row.addView(ImageView(windowContext!!).apply {
-                    setImageDrawable(HuStatusIcon(kind)); contentDescription = description
+                    scaleType = ImageView.ScaleType.CENTER_INSIDE
+                    setImageDrawable(HuPanelIcons.drawable(context, kind)); contentDescription = description
                     setPadding(px(2), px(2), px(2), px(2))
-                }, LinearLayout.LayoutParams(0, px(24), 1f))
+                }, LinearLayout.LayoutParams(px(24), px(24)))
             }
             if (caps.any { it.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) }) add("wifi", "Wi-Fi подключён")
             if (bt) add("bluetooth", "Bluetooth включён")
@@ -416,25 +462,44 @@ class HuNavigationOverlay(
                 }.getOrDefault("")
                 if (generation.isNotBlank()) row.addView(label(generation, 11f).apply { setPadding(0, 0, px(2), 0) })
             }
-            if (caps.any { it.hasTransport(NetworkCapabilities.TRANSPORT_VPN) }) add("vpn", "VPN включён")
-            if (location) add("location", "Геолокация включена")
         }
         val percent = if (level >= 0 && scale > 0) "${level * 100 / scale}%" else "—"
-        statusButton?.text = "${if (charge) "⚡" else ""}$percent  ${SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())}"
+        val batteryPercent = if (level >= 0 && scale > 0) (level * 100 / scale).coerceIn(0, 100) else null
+        batteryIcon?.apply {
+            setImageDrawable(HuBatteryIcon(batteryPercent, charge))
+            contentDescription = "Батарея $percent${if (charge) ", подключено питание" else ""}"
+        }
+        statusButton?.text = "$percent  ${SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())}"
         val icons = notificationIcons ?: return
         icons.removeAllViews()
         // Charging/USB system notices are not application notifications in the dock.
         val notices = visibleNotifications().filter { it.packageName !in setOf("android", "com.android.systemui") }
             .distinctBy { it.packageName }
-        notices.take(2).forEach { item ->
+        // Connectivity, battery and clock reserve their natural width. Notifications grow
+        // leftwards into the remaining space of this section, never into the app dock.
+        val slotWidth = px(22).coerceAtLeast(1)
+        val capacity = (icons.width / slotWidth).coerceAtLeast(0)
+        val overflow = notices.size > capacity
+        val shownCount = if (overflow) (capacity - 1).coerceAtLeast(0) else notices.size
+        notices.take(shownCount).forEach { item ->
             val icon = ImageView(windowContext!!).apply {
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                setPadding(px(1), px(1), px(1), px(1))
                 setImageDrawable(runCatching { context.packageManager.getApplicationIcon(item.packageName) }.getOrNull())
                 contentDescription = "Уведомления ${item.packageName}"
                 setOnClickListener { toggleShade() }
             }
-            icons.addView(icon, LinearLayout.LayoutParams(px(20), px(23)))
+            icons.addView(icon, LinearLayout.LayoutParams(slotWidth, px(23)))
         }
-        if (notices.size > 2) icons.addView(label("+", 10f).apply { setPadding(0, 0, 0, 0) })
+        if (overflow && capacity > 0) {
+            val remaining = notices.size - shownCount
+            icons.addView(label("+$remaining", 10f).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, 0)
+                contentDescription = "Ещё $remaining приложений с уведомлениями"
+                setOnClickListener { toggleShade() }
+            }, LinearLayout.LayoutParams(slotWidth, px(23)))
+        }
     }
 
     private fun toggleShade() {
@@ -467,7 +532,7 @@ class HuNavigationOverlay(
                     setPadding(px(3), px(6), px(3), px(6))
                     contentDescription = name
                     setOnClickListener { dismissApplications(); onSettings(action) }
-                    addView(ImageView(wc).apply { setImageDrawable(HuStatusIcon(kind, Color.rgb(137, 198, 255))) },
+                    addView(ImageView(wc).apply { scaleType = ImageView.ScaleType.CENTER_INSIDE; setImageDrawable(HuPanelIcons.drawable(context, kind)) },
                         LinearLayout.LayoutParams(px(23), px(23)))
                     addView(label(name, 13f).apply {
                         gravity = Gravity.CENTER; maxLines = 1; ellipsize = TextUtils.TruncateAt.END
@@ -547,29 +612,38 @@ class HuNavigationOverlay(
         }
     }
 
-    private fun notificationCard(item: StatusBarNotification): LinearLayout {
+    private fun notificationCard(item: StatusBarNotification, compact: Boolean = false): LinearLayout {
         val n = item.notification
         val appName = runCatching { context.packageManager.getApplicationLabel(context.packageManager.getApplicationInfo(item.packageName, 0)).toString() }.getOrDefault(item.packageName)
         return LinearLayout(windowContext!!).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(px(5), px(5), px(5), px(7))
+            setPadding(px(if (compact) 10 else 5), px(if (compact) 8 else 5), px(5), px(if (compact) 8 else 7))
             val heading = LinearLayout(windowContext!!).apply { gravity = Gravity.CENTER_VERTICAL }
             heading.addView(ImageView(windowContext!!).apply {
                 setImageDrawable(runCatching { context.packageManager.getApplicationIcon(item.packageName) }.getOrNull()
                     ?: runCatching { n.smallIcon?.loadDrawable(context) }.getOrNull())
                 scaleType = ImageView.ScaleType.FIT_CENTER
                 contentDescription = appName
-            }, LinearLayout.LayoutParams(px(28), px(28)).apply { leftMargin = px(10) })
+            }, LinearLayout.LayoutParams(px(if (compact) 22 else 28), px(if (compact) 22 else 28)).apply {
+                leftMargin = px(if (compact) 0 else 10); rightMargin = px(6)
+            })
             heading.addView(label(appName, 14f).apply {
                 maxLines = 1; ellipsize = TextUtils.TruncateAt.END
                 setTextColor(Color.rgb(137, 198, 255))
-            }, LinearLayout.LayoutParams(0, px(34), 1f))
+                if (compact) { setPadding(0, 0, 0, 0); includeFontPadding = false }
+            }, LinearLayout.LayoutParams(0, px(if (compact) 24 else 34), 1f))
             addView(heading)
             val content = HuNotificationContent.read(windowContext!!, item)
             val title = content.title
             val text = content.text
-            addView(label(title.ifBlank { "Уведомление" }, 18f).apply { maxLines = 2; ellipsize = TextUtils.TruncateAt.END })
-            if (text.isNotBlank()) addView(label(text, 16f).apply { maxLines = 4; ellipsize = TextUtils.TruncateAt.END })
+            addView(label(title.ifBlank { "Уведомление" }, 18f).apply {
+                maxLines = if (compact) 1 else 2; ellipsize = TextUtils.TruncateAt.END
+                if (compact) { setPadding(0, 0, 0, 0); includeFontPadding = false }
+            })
+            if (text.isNotBlank()) addView(label(text, 16f).apply {
+                maxLines = if (compact) 2 else 4; ellipsize = TextUtils.TruncateAt.END
+                if (compact) { setPadding(0, 0, 0, 0); includeFontPadding = false }
+            })
             setOnClickListener { openNotification(item) }
             installNotificationGesture(this, item)
         }
@@ -644,6 +718,7 @@ class HuNavigationOverlay(
         if(items.any { it.packageName==foreground }) {
             main.removeCallbacks(finishMissingNavigation); navigationCueMissingAt=0L
             navigationCue?.hide(); navigationCueNotificationKey=""
+            publishCueVisibility(false)
             return
         }
         val candidate=items.firstOrNull { it.key==navigationCueNotificationKey } ?: items.firstOrNull()
@@ -658,33 +733,47 @@ class HuNavigationOverlay(
             }
             main.removeCallbacks(finishMissingNavigation); navigationCueMissingAt=0L
             navigationCue?.hide(); navigationCueNotificationKey=""
+            publishCueVisibility(false)
             return
         }
         main.removeCallbacks(finishMissingNavigation); navigationCueMissingAt=0L
         val content=HuNotificationContent.read(wc,candidate)
-        val card=navigationCue ?: HuNavigationCue(wc,wm,width,density) { openNotification(it) }
+        val card=navigationCue ?: HuNavigationCue(wc,wm,width,density,resizeForMusic) { openNotification(it) }
             .also { navigationCue=it }
+        val geometry=HuTopCardLayout(width,density,resizeForMusic)
+        card.setPlacement(navigationOnRight,
+            navigationCardHeight.takeIf { it>0 } ?: geometry.navigationHeight,
+            navigationCardInset.takeIf { navigationCardHeight>0 } ?: geometry.inset)
         card.show(candidate,content)
+        publishCueVisibility(card.visible)
         navigationCueNotificationKey=candidate.key
-        val signState="${candidate.packageName}:${content.roadSign!=null}:${content.speedLimitKmh!=null}"
+        val sceneContent=HuNavigationSceneContent.read(content)
+        val signState="${candidate.packageName}:${content.roadSign!=null}:${content.speedLimitKmh!=null}:${content.graphicRole}:${sceneContent.turn}"
         if(signState!=navigationCueSignState) {
             navigationCueSignState=signState
-            SessionDiagnostics.event("HU navigation cue content; package=${candidate.packageName}; roadImage=${content.roadSign!=null}; explicitSpeedLimit=${content.speedLimitKmh!=null}")
+            SessionDiagnostics.event("HU navigation cue content; package=${candidate.packageName}; roadImage=${content.roadSign!=null}; explicitSpeedLimit=${content.speedLimitKmh!=null}; graphic=${content.graphicRole}; turn=${sceneContent.turn}; distance=${sceneContent.distance.orEmpty()}")
         }
     }
 
     private fun showBanner(item: StatusBarNotification) {
         if (view == null || shade != null) return
         removeBanner()
-        val card = notificationCard(item)
+        val card = notificationCard(item, compact = true)
+        val geometry = HuTopCardLayout(width, density, resizeForMusic)
         val line = LinearLayout(windowContext!!).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.rgb(29, 42, 57))
-            addView(card, LinearLayout.LayoutParams(0, -2, 1f))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(23, 39, 56)); cornerRadius = geometry.radius
+            }
+            clipToOutline = true
+            addView(card, LinearLayout.LayoutParams(0, -1, 1f))
             addView(button("×", "Скрыть уведомление") { removeBanner() }, LinearLayout.LayoutParams(px(44), px(44)))
         }
-        val params = layout((width * 0.65f).roundToInt(), -2, Gravity.TOP or Gravity.END)
+        val params = layout(geometry.notificationWidth, geometry.height,
+            Gravity.TOP or if(navigationOnRight) Gravity.START else Gravity.END).apply {
+            x = geometry.inset; y = geometry.inset
+        }
         runCatching { manager?.addView(line, params) }.onSuccess { banner = line; main.postDelayed(hideBanner, 6500) }
     }
 
@@ -694,8 +783,8 @@ class HuNavigationOverlay(
         banner = null
     }
 
-    fun setPhoneVisible(visible: Boolean) { phoneVisible = visible; phoneButton?.setImageDrawable(HuStatusIcon(if (visible) "phone_on" else "phone_off", Color.rgb(137, 198, 255))) }
-    fun setMediaVisible(visible: Boolean) { mediaVisible = visible; mediaButton?.setImageDrawable(HuStatusIcon(if (visible) "display" else "music", Color.rgb(137, 198, 255))) }
+    fun setPhoneVisible(visible: Boolean) { phoneVisible = visible; phoneButton?.setImageDrawable(HuPanelIcons.drawable(context, if (visible) "phone_on" else "phone_off")) }
+    fun setMediaVisible(visible: Boolean) { mediaVisible = visible; mediaButton?.setImageDrawable(HuPanelIcons.drawable(context, if (visible) "display" else "music")) }
     private fun toggleKeyboard() {
         if (keyboard != null) { keyboard?.close(); keyboard = null; return }
         dismissApplications()
@@ -732,9 +821,11 @@ class HuNavigationOverlay(
         view?.let { runCatching { manager?.removeViewImmediate(it) } }
         main.removeCallbacks(finishMissingNavigation)
         navigationCue?.close(); navigationCue=null; navigationCueNotificationKey=""
+        publishCueVisibility(false)
+        navigationCardHeight=0; navigationCardInset=0
         navigationCueMissingAt=0L; navigationCueSignState=""
         view = null; manager = null; windowContext = null; displayId = -1
-        dock = null; phoneButton = null; mediaButton = null; statusButton = null; notificationIcons = null
+        dock = null; phoneButton = null; mediaButton = null; statusButton = null; batteryIcon = null; notificationIcons = null
         connectionIcons = null
         activePackage = null; navigationForegroundPackage=null
         historyKey = ""

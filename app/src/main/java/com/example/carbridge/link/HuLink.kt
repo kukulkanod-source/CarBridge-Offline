@@ -28,6 +28,10 @@ interface HuLink {
     data class NavigationInfo(val action: Int, val nextTurn: Int, val roadName: String,
         val totalDistance: Int, val remainingDistance: Int, val turnImage: ByteArray = ByteArray(0))
     fun sendNavigation(info: NavigationInfo): Boolean = false
+    fun setNavigationActive(active: Boolean): Boolean = false
+    val navigationEpoch: Long get() = 0L
+    fun startMicrophoneProbe(): Boolean = false
+    fun stopMicrophoneProbe() { }
 
     data class TouchEvent(
         val action: Int,
@@ -48,6 +52,7 @@ interface HuLink {
         fun onHardKey(code: Int)
         fun onAudioSuspend() { }
         fun onAudioResume() { }
+        fun onDiagnosticStatus(message: String) { }
 
         /** ГУ потерял кадры и просит ключевой. */
         fun onRequestKeyframe()

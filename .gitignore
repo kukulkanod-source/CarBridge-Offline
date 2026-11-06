@@ -1,6 +1,11 @@
 # Local build and IDE files
 .gradle/
 .idea/
+.android*/
+.build-home/
+.gradle-home/
+.tmp/
+outputs/
 **/build/
 local.properties
 *.iml
@@ -20,5 +25,6 @@ signing.properties
 # Session reports and distributed packages
 *.log
 *.log.bin
+*.hprof
 *.apk
 *.aab

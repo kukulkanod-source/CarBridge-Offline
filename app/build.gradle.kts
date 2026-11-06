@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.carbridge.adb"
         minSdk = 30
         targetSdk = 34
-        versionCode = 44
-        versionName = "0.43-assistant-notifications"
+        versionCode = 65
+        versionName = "0.64-navigation-road-perspective"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

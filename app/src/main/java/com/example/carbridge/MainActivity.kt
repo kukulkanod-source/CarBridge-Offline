@@ -210,6 +210,14 @@ class MainActivity : AppCompatActivity() {
         text("USB-звук: Android 12+, отдельный PCM-канал, только при воспроизведении. " +
             "Включение и выключение во время сессии не требует перезапуска дисплея. " +
             "Это первая проверка общего звука; отдельный канал навигационных подсказок ещё не подключён.")
+        button("Проверить микрофон ГУ — 10 секунд") {
+            sendCommand(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_MICROPHONE_PROBE))
+        }
+        button("Остановить проверку микрофона ГУ") {
+            sendCommand(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_MICROPHONE_PROBE_STOP))
+        }
+        text("Проверяйте на стоянке при подключённом CarLife. Произнесите несколько слов: результат появится в статусе и журнале. " +
+            "Звук не сохраняется в файл. Проверка не подключает микрофон к Алисе и автоматически заканчивается через 10 секунд.")
         layout.addView(CheckBox(this).apply {
             text = "Навигационные данные CarLife — эксперимент"
             isChecked = BridgeSettings.read(this@MainActivity).carLifeNavigation
@@ -289,7 +297,7 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
             },
             stop = {
-                wizard.cancelConnectionRequest()
+                wizard.cancelPreparation("Подготовка и запрос подключения остановлены.")
                 sendCommand(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_STOP))
                 wizard.connectionFailed("Соединение остановлено. Для нового подключения нажмите «Проверить и продолжить».")
             })
@@ -375,6 +383,8 @@ class MainActivity : AppCompatActivity() {
             ConnectionWizard.Action.DEBUG_SETTINGS -> openWizardSettings(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
             ConnectionWizard.Action.WIFI -> openWizardSettings(Settings.ACTION_WIFI_SETTINGS)
             ConnectionWizard.Action.WIRELESS, ConnectionWizard.Action.PAIR -> {
+                wizard.resumePreparation()
+                ConnectionPreparationService.ensureStarted(applicationContext)
                 if (action == ConnectionWizard.Action.PAIR) PairingPrompt.show(applicationContext)
                 openWizardSettings("android.settings.WIRELESS_DEBUGGING_SETTINGS", Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
             }
@@ -789,6 +799,7 @@ class MainActivity : AppCompatActivity() {
             BridgeSettings.DISPLAY_MODE_HU,
             BridgeSettings.DISPLAY_MODE_1600_900,
             BridgeSettings.DISPLAY_MODE_1920_1080,
+            BridgeSettings.DISPLAY_MODE_1920_960,
         )
         val labels = modes.map(::logicalDisplayModeLabel).toTypedArray()
         val selected = modes.indexOf(BridgeSettings.read(this).logicalDisplayMode).coerceAtLeast(0)
@@ -802,6 +813,8 @@ class MainActivity : AppCompatActivity() {
                         "Выбран виртуальный экран 1600×900. Остановите сессию и переподключитесь."
                     BridgeSettings.DISPLAY_MODE_1920_1080 ->
                         "Включён эксперимент 1920×1080 при 300 dpi. Видео для ГУ останется 1280×720; остановите сессию и переподключитесь."
+                    BridgeSettings.DISPLAY_MODE_1920_960 ->
+                        "Выбран экран 1920×960 / 300 DPI для ГУ 1280×640 (2:1). Остановите сессию и переподключитесь: текущее окно само не меняется."
                     else -> "Экспериментальный размер выключен. Остановите сессию и переподключитесь, чтобы применить обычный размер ГУ."
                 }
                 showStatus(statusMessage)
@@ -812,6 +825,7 @@ class MainActivity : AppCompatActivity() {
     private fun logicalDisplayModeLabel(mode: String): String = when (mode) {
         BridgeSettings.DISPLAY_MODE_1600_900 -> "1600×900 / 250 dpi"
         BridgeSettings.DISPLAY_MODE_1920_1080 -> "1920×1080 / 300 dpi — рекомендуемый"
+        BridgeSettings.DISPLAY_MODE_1920_960 -> "1920×960 / 300 dpi — для ГУ 1280×640 (2:1)"
         else -> "Размер ГУ / 200 dpi — меньшая нагрузка"
     }
 

@@ -3,171 +3,142 @@ package com.example.carbridge
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
+import android.util.TypedValue
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.CheckBox
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.util.TypedValue
 import kotlin.math.roundToInt
 
-/** One window owns both the drawer and its outside-tap area. Editing never launches an app. */
+/** Bottom favourites strip and in-window picker, without a side handle or Presentation. */
 internal class HuFavoritesPanel(private val context: Context, private val wm: WindowManager,
     private val width: Int, private val height: Int, private val bottom: Int, private val density: Float,
     private val launch: (String) -> Unit, private val beforeOpen: () -> Unit) {
-    private val prefs = context.getSharedPreferences("hu_favorites", Context.MODE_PRIVATE)
-    private var right = prefs.getBoolean("right", true)
-    private val selected = prefs.getString("packages", "").orEmpty().split('|').filter { it.isNotBlank() }.toMutableList()
-    private var handle: View? = null
-    private var window: FrameLayout? = null
-    private var pane: LinearLayout? = null
-    private var body: LinearLayout? = null
-    private var heading: TextView? = null
-    private var editButton: TextView? = null
-    private var sideButton: TextView? = null
-    private var editing = false
-    private var apps = emptyList<HuAppCatalog.App>()
-    private var loaded = false
-    private var revision = 0
-    val isOpen: Boolean get() = window != null
-    private fun px(n: Int) = (n * density).roundToInt()
-    private fun params(w: Int, h: Int, gravity: Int) = WindowManager.LayoutParams(w, h,
-        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-        PixelFormat.TRANSLUCENT).apply { this.gravity = gravity; title = "CarBridge favorites" }
-    fun showHandle() {
-        handle?.let { runCatching { wm.removeViewImmediate(it) } }; handle = null
-        var start = 0f
-        val edge = TextView(context).apply {
-            text = "★"; gravity = Gravity.CENTER; setTextColor(Color.rgb(137,198,255))
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, 20f*density)
-            setBackgroundColor(Color.rgb(25,39,56)); contentDescription = "Избранные приложения"
-            setOnClickListener { if (isOpen) dismiss("handle") else open(false) }
-            setOnTouchListener { v,e ->
-                when(e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { start=e.rawX; true }
-                    MotionEvent.ACTION_UP -> {
-                        if ((this@HuFavoritesPanel.right && start-e.rawX>px(20)) || (!this@HuFavoritesPanel.right && e.rawX-start>px(20))) open(false)
-                        else v.performClick()
-                        true
-                    }
-                    else -> true
-                }
-            }
-        }
-        runCatching { wm.addView(edge, params(px(25),px(52),Gravity.TOP or if(right) Gravity.END else Gravity.START).apply {
-            y = (height*0.70f).roundToInt().coerceAtMost((height-bottom-px(52)).coerceAtLeast(0))
-        }) }.onSuccess { handle=edge; edge.visibility=if(isOpen) View.GONE else View.VISIBLE }
-    }
-    private fun save() { prefs.edit().putString("packages",selected.joinToString("|")).apply() }
-    private fun text(value: String, size: Float=16f) = TextView(context).apply {
+    private val prefs=context.getSharedPreferences("hu_favorites",Context.MODE_PRIVATE)
+    private val slots=prefs.getString("packages","").orEmpty().split('|').toMutableList()
+    private var window: FrameLayout?=null
+    private var apps=emptyList<HuAppCatalog.App>()
+    private var loaded=false
+    private var pickingSlot: Int?=null
+    private var revision=0
+    val isOpen: Boolean get()=window!=null
+    private fun px(n: Int)=(n*density).roundToInt().coerceAtLeast(1)
+    private fun label(value: String, size: Float)=TextView(context).apply {
         text=value; setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_PX,size*density)
-        gravity=Gravity.CENTER_VERTICAL; setPadding(px(10),px(8),px(10),px(8))
+        gravity=Gravity.CENTER; includeFontPadding=false; maxLines=1; ellipsize=TextUtils.TruncateAt.END
     }
-    private fun action(value: String, block: () -> Unit) = text(value).apply {
-        setTextColor(Color.rgb(137,198,255)); setOnClickListener { block() }
-    }
-    private fun paneLayout() = FrameLayout.LayoutParams((width*0.44f).roundToInt(),-1,
-        Gravity.TOP or if(right) Gravity.END else Gravity.START)
-    fun open(edit: Boolean) {
-        if (isOpen) { editing=edit; render(); return }
-        beforeOpen()
-        editing=edit; loaded=false
+    private fun background()=GradientDrawable().apply { setColor(Color.rgb(22,32,46)); cornerRadius=px(10).toFloat() }
+    fun open() {
+        if(isOpen) { dismiss(); return }
+        beforeOpen(); pickingSlot=null; loaded=false
         val frame=FrameLayout(context)
-        frame.addView(View(context).apply {
-            setBackgroundColor(0x44000000); contentDescription="Закрыть избранное"
-            setOnClickListener { dismiss("outside") }
-        },FrameLayout.LayoutParams(-1,-1))
-        val panel=LinearLayout(context).apply {
-            orientation=LinearLayout.VERTICAL; setBackgroundColor(Color.rgb(22,32,46))
-            isClickable=true // Blank space inside the drawer must not reach the outside-tap area.
-        }
-        val header=LinearLayout(context).apply { gravity=Gravity.CENTER_VERTICAL }
-        heading=text("Избранное",18f)
-        header.addView(heading,LinearLayout.LayoutParams(0,px(48),1f))
-        header.addView(action("×") { dismiss("close_button") },LinearLayout.LayoutParams(px(42),px(48)))
-        panel.addView(header)
-        val actions=LinearLayout(context)
-        editButton=action("") {
-            editing=!editing; render()
-            SessionDiagnostics.event("HU favorites edit mode=$editing")
-        }
-        actions.addView(editButton,LinearLayout.LayoutParams(0,px(50),1f))
-        sideButton=action("") {
-            right=!right; prefs.edit().putBoolean("right",right).apply()
-            pane?.layoutParams=paneLayout(); showHandle(); render()
-        }
-        actions.addView(sideButton,LinearLayout.LayoutParams(px(112),px(50)))
-        panel.addView(actions)
-        body=LinearLayout(context).apply { orientation=LinearLayout.VERTICAL }
-        panel.addView(ScrollView(context).apply { addView(body) },LinearLayout.LayoutParams(-1,0,1f))
-        frame.addView(panel,paneLayout())
+        val params=WindowManager.LayoutParams(width,(height-bottom).coerceAtLeast(1),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT).apply { gravity=Gravity.TOP or Gravity.START; title="CarBridge favorites strip" }
         try {
-            wm.addView(frame,params(width,height-bottom,Gravity.TOP or Gravity.START))
-            window=frame; pane=panel; handle?.visibility=View.GONE
-            val current=++revision
-            render()
+            wm.addView(frame,params); window=frame; render()
+            val token=++revision
             HuAppCatalog.load(context) { entries ->
-                if(current!=revision || window!==frame) return@load
+                if(token!=revision || window!==frame) return@load
                 apps=entries.sortedBy { it.label.lowercase() }; loaded=true; render()
             }
-            SessionDiagnostics.event("HU favorites opened; editing=$editing; right=$right; selected=${selected.size}")
+            SessionDiagnostics.event("HU favorites bottom strip opened; selected=${slots.count { it.isNotBlank() }}")
         } catch(error: Exception) {
-            dismiss("open_failed")
-            SessionDiagnostics.event("HU favorites failed: ${error.javaClass.simpleName}: ${error.message}")
+            dismiss(); SessionDiagnostics.event("HU favorites strip failed: ${error.javaClass.simpleName}")
         }
+    }
+    private fun save() {
+        while(slots.isNotEmpty() && slots.last().isBlank()) slots.removeAt(slots.lastIndex)
+        prefs.edit().putString("packages",slots.joinToString("|")).apply()
     }
     private fun render() {
-        val target=body ?: return
-        heading?.text=if(editing) "Выберите приложения" else "Избранное"
-        editButton?.text=if(editing) "✓ Готово" else "+ Добавить / убрать"
-        sideButton?.text=if(right) "← Влево" else "Вправо →"
-        target.removeAllViews()
-        if(!loaded) { target.addView(text("Загружаю приложения…")); return }
-        val shown=if(editing) apps else selected.mapNotNull { pkg -> apps.firstOrNull { it.component.packageName==pkg } }
-        if(shown.isEmpty()) target.addView(text(if(editing) "Приложения не найдены" else "Нажмите «Добавить / убрать», чтобы выбрать приложения"))
-        shown.forEach { app ->
-            val pkg=app.component.packageName
-            val row=LinearLayout(context).apply {
-                gravity=Gravity.CENTER_VERTICAL; setPadding(px(8),px(4),px(8),px(4))
+        val frame=window ?: return
+        frame.removeAllViews()
+        frame.addView(View(context).apply {
+            contentDescription="Закрыть избранное"; setOnClickListener { dismiss() }
+        },FrameLayout.LayoutParams(-1,-1))
+        val count=((width-px(12))/px(72)).coerceIn(4,24)
+        val cellWidth=((width-px(12))/count).coerceAtLeast(1)
+        val itemCount=maxOf(count,slots.indexOfLast { it.isNotBlank() }+2)
+        val row=LinearLayout(context).apply { gravity=Gravity.CENTER_VERTICAL }
+        repeat(itemCount) { index ->
+            val pkg=slots.getOrNull(index).orEmpty()
+            val app=apps.firstOrNull { it.component.packageName==pkg }
+            val cell=LinearLayout(context).apply {
+                orientation=LinearLayout.VERTICAL; gravity=Gravity.CENTER
+                setPadding(px(3),px(3),px(3),px(3))
             }
-            row.addView(ImageView(context).apply { setImageDrawable(app.icon?.newDrawable(context.resources)) },LinearLayout.LayoutParams(px(36),px(36)))
-            row.addView(text(app.label).apply { maxLines=2 },LinearLayout.LayoutParams(0,px(58),1f))
-            if(editing) {
-                val check=CheckBox(context).apply {
-                    isChecked=pkg in selected
-                    contentDescription="${app.label}: в избранном"
-                    buttonTintList=android.content.res.ColorStateList.valueOf(Color.rgb(137,198,255))
-                    setOnCheckedChangeListener { _, checked ->
-                        if(checked && pkg !in selected) selected.add(pkg)
-                        else if(!checked) selected.remove(pkg)
-                        save()
-                        SessionDiagnostics.event("HU favorite selection changed; package=$pkg; selected=$checked; editing=$editing")
-                    }
-                }
-                row.addView(check,LinearLayout.LayoutParams(px(48),px(48)))
-                row.setOnClickListener { if(editing) check.isChecked=!check.isChecked }
+            if(pkg.isBlank()) {
+                cell.addView(label("+",30f),LinearLayout.LayoutParams(-1,px(42)))
+                cell.contentDescription="Добавить приложение в ячейку ${index+1}"
+                cell.setOnClickListener { pickingSlot=index; render() }
             } else {
-                row.contentDescription="Открыть ${app.label}"
-                row.setOnClickListener { if(!editing) { dismiss("launch:$pkg"); launch(pkg) } }
-                row.setOnLongClickListener {
-                    if(!editing) { selected.remove(pkg); save(); render() }
-                    true
-                }
+                cell.addView(ImageView(context).apply {
+                    scaleType=ImageView.ScaleType.FIT_CENTER
+                    setImageDrawable(app?.icon?.newDrawable(context.resources)
+                        ?: runCatching { context.packageManager.getApplicationIcon(pkg) }.getOrNull())
+                },LinearLayout.LayoutParams(px(34),px(34)))
+                cell.addView(label(app?.label ?: pkg.substringAfterLast('.'),10f),LinearLayout.LayoutParams(-1,px(17)))
+                cell.contentDescription="Открыть ${app?.label ?: pkg}; удерживайте для замены или удаления"
+                cell.setOnClickListener { dismiss(); launch(pkg) }
+                cell.setOnLongClickListener { pickingSlot=index; render(); true }
             }
-            target.addView(row)
+            row.addView(cell,LinearLayout.LayoutParams(cellWidth,-1))
         }
+        val strip=HorizontalScrollView(context).apply {
+            background=background(); clipToOutline=true; isHorizontalScrollBarEnabled=false
+            addView(row,FrameLayout.LayoutParams(-2,-1))
+        }
+        frame.addView(strip,FrameLayout.LayoutParams(width-px(12),px(64),Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin=px(4)
+        })
+        pickingSlot?.let { renderPicker(frame,it) }
     }
-    fun dismiss(reason: String = "other_ui_or_session") {
-        if(window!=null) SessionDiagnostics.event("HU favorites dismissed; reason=$reason; editing=$editing")
-        revision++
+    private fun renderPicker(frame: FrameLayout, slot: Int) {
+        frame.addView(View(context).apply {
+            setBackgroundColor(0x66000000); setOnClickListener { pickingSlot=null; render() }
+        },FrameLayout.LayoutParams(-1,-1))
+        val picker=LinearLayout(context).apply {
+            orientation=LinearLayout.VERTICAL; background=background(); clipToOutline=true; isClickable=true
+        }
+        val heading=LinearLayout(context).apply { gravity=Gravity.CENTER_VERTICAL }
+        heading.addView(label("Выбрать приложение",17f),LinearLayout.LayoutParams(0,px(44),1f))
+        heading.addView(label("×",26f).apply { setOnClickListener { pickingSlot=null; render() } },LinearLayout.LayoutParams(px(44),px(44)))
+        picker.addView(heading)
+        if(!slots.getOrNull(slot).isNullOrBlank()) picker.addView(label("Удалить из избранного",15f).apply {
+            setTextColor(Color.rgb(255,153,153))
+            setOnClickListener { slots[slot]=""; save(); pickingSlot=null; render() }
+        },LinearLayout.LayoutParams(-1,px(42)))
+        val choices=LinearLayout(context).apply { orientation=LinearLayout.VERTICAL }
+        if(!loaded) choices.addView(label("Загружаю приложения…",16f))
+        else if(apps.isEmpty()) choices.addView(label("Приложения не найдены",16f))
+        apps.forEach { app ->
+            val pkg=app.component.packageName
+            val row=LinearLayout(context).apply { gravity=Gravity.CENTER_VERTICAL; setPadding(px(10),px(4),px(10),px(4)) }
+            row.addView(ImageView(context).apply { setImageDrawable(app.icon?.newDrawable(context.resources)) },LinearLayout.LayoutParams(px(34),px(34)))
+            row.addView(label(app.label,16f),LinearLayout.LayoutParams(0,px(44),1f))
+            row.setOnClickListener {
+                while(slots.size<=slot) slots.add("")
+                for(i in slots.indices) if(slots[i]==pkg) slots[i]=""
+                slots[slot]=pkg; save(); pickingSlot=null; render()
+                SessionDiagnostics.event("HU favorite slot assigned; slot=$slot; package=$pkg")
+            }
+            choices.addView(row)
+        }
+        picker.addView(ScrollView(context).apply { addView(choices) },LinearLayout.LayoutParams(-1,0,1f))
+        frame.addView(picker,FrameLayout.LayoutParams(minOf(px(560),width-px(24)),
+            ((height-bottom)*0.78f).roundToInt().coerceAtLeast(1),Gravity.CENTER))
+    }
+    fun dismiss(reason: String="other_ui_or_session") {
+        revision++; pickingSlot=null
         window?.let { runCatching { wm.removeViewImmediate(it) } }; window=null
-        pane=null; body=null; heading=null; editButton=null; sideButton=null
-        handle?.visibility=View.VISIBLE
     }
-    fun close() { dismiss("session_close"); handle?.let { runCatching { wm.removeViewImmediate(it) } }; handle=null }
+    fun close()=dismiss("session_close")
 }

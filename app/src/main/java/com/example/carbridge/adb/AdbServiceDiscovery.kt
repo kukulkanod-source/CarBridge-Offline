@@ -5,6 +5,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Handler
 import android.os.Looper
+import android.os.Build
 import java.net.InetAddress
 import java.net.NetworkInterface
 
@@ -17,6 +18,7 @@ internal class AdbServiceDiscovery(context: Context, private val changed: () -> 
     private val endpoints = linkedMapOf<String, Endpoint>()
     private val pending = ArrayDeque<NsdServiceInfo>()
     private val present = mutableSetOf<String>()
+    private val modern = mutableMapOf<String, NsdManager.ServiceInfoCallback>()
     private var resolving = false
     private var generation = 0
     private var resolutionSerial = 0
@@ -39,13 +41,19 @@ internal class AdbServiceDiscovery(context: Context, private val changed: () -> 
                     override fun onServiceFound(info: NsdServiceInfo) { main.post {
                         if (generation == token) {
                             val key = "$kind:${info.serviceName}"
-                            if (present.add(key)) { pending.addLast(info); resolveNext(token) }
+                            if (present.add(key)) {
+                                if (Build.VERSION.SDK_INT >= 34) trackModern(info, kind, key, token)
+                                else { pending.addLast(info); resolveNext(token) }
+                            }
                         }
                     } }
                     override fun onServiceLost(info: NsdServiceInfo) { main.post {
                         if (generation == token) {
                             val key = "$kind:${info.serviceName}"
                             present.remove(key)
+                            if (Build.VERSION.SDK_INT >= 34) modern.remove(key)?.let {
+                                runCatching { manager.unregisterServiceInfoCallback(it) }
+                            }
                             if (endpoints.remove(key) != null) publish()
                         }
                     } }
@@ -55,6 +63,39 @@ internal class AdbServiceDiscovery(context: Context, private val changed: () -> 
             }
         }
     }
+
+    @android.annotation.TargetApi(34)
+    private fun trackModern(info: NsdServiceInfo, kind: String, key: String, token: Int) {
+        val callback = object : NsdManager.ServiceInfoCallback {
+            override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                main.post {
+                    if (generation != token || modern[key] !== this) return@post
+                    modern.remove(key)
+                    // A ROM may reject observation while still supporting the older resolver.
+                    pending.addLast(info); resolveNext(token)
+                }
+            }
+            override fun onServiceInfoCallbackUnregistered() { }
+            override fun onServiceLost() {
+                main.post { if (generation == token && modern[key] === this && endpoints.remove(key) != null) publish() }
+            }
+            override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                main.post {
+                    if (generation != token || modern[key] !== this || key !in present) return@post
+                    if (serviceInfo.port in 1..65535 && serviceInfo.hostAddresses.any(::isOwnAddress)) {
+                        endpoints[key] = Endpoint(kind, serviceInfo.serviceName, serviceInfo.port)
+                        publish()
+                    } else if (endpoints.remove(key) != null) publish()
+                }
+            }
+        }
+        modern[key] = callback
+        runCatching { manager.registerServiceInfoCallback(info, contextExecutor, callback) }.onFailure {
+            modern.remove(key); pending.addLast(info); resolveNext(token)
+        }
+    }
+
+    private val contextExecutor = java.util.concurrent.Executor { runnable -> main.post(runnable) }
 
     @Suppress("DEPRECATION")
     private fun resolveNext(token: Int) {
@@ -95,6 +136,10 @@ internal class AdbServiceDiscovery(context: Context, private val changed: () -> 
     private fun publish() { snapshot = endpoints.values.toList(); changed() }
     fun stop() { main.post {
         generation++
+        if (Build.VERSION.SDK_INT >= 34) modern.values.forEach {
+            runCatching { manager.unregisterServiceInfoCallback(it) }
+        }
+        modern.clear()
         listeners.forEach { runCatching { manager.stopServiceDiscovery(it) } }
         listeners.clear(); pending.clear(); present.clear(); endpoints.clear()
         resolving = false; snapshot = emptyList()

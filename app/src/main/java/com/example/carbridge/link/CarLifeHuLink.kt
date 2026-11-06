@@ -56,6 +56,32 @@ class CarLifeHuLink internal constructor(
     private var lastAudioStatsNs = 0L
     private val keyframeRequested = AtomicBoolean(false)
     private val lastWriteProgressNs = AtomicLong(System.nanoTime())
+    private val profile = HuSessionProfile()
+    private val completedWireBytes = AtomicLong()
+    private val completedVideoFrames = AtomicLong()
+    private val writeBusyNs = AtomicLong()
+    private val lastVideoCompletedNs = AtomicLong()
+    private val heartbeatPending = AtomicBoolean()
+    private var lastWireReportNs = System.nanoTime()
+    private var reportedWireBytes = 0L
+    private var reportedBusyNs = 0L
+    private var heartbeatCount = 0L
+    private val navigationLock = Any()
+    private var navigationActive = false
+    private var navigationSubscribed: Boolean? = null
+    private var navigationStartedNs = 0L
+    private var navigationShowRequired = true
+    private var navigationFallbackLogged = false
+    private val navEpoch = AtomicLong()
+    override val navigationEpoch: Long get() = navEpoch.get()
+    private val microphoneLock = Any()
+    private var probeActive = false
+    private var probeRevision = 0L
+    private var probeStartedNs = 0L
+    private var probeBytes = 0L
+    private var probePackets = 0L
+    private var probePeak = 0
+    private var probeMalformed = 0L
 
     private val frames = FrameReader()
     private val inner = InnerAssembler()
@@ -100,6 +126,7 @@ class CarLifeHuLink internal constructor(
     }
 
     override fun stop() {
+        finishMicrophoneProbe("сессия закрыта")
         if (!closed.compareAndSet(false, true)) return
         packets.close()
         runCatching { sched.shutdownNow() }
@@ -149,9 +176,101 @@ class CarLifeHuLink internal constructor(
     override fun sendMediaProgress(seconds: Int): Boolean =
         !closed.get() && matchSent && sendCmd(Msg.MEDIA_PROGRESS_BAR, Msgs.mediaProgress(seconds))
 
-    override fun sendNavigation(info: HuLink.NavigationInfo): Boolean =
-        !closed.get() && matchSent && info.action in 1..3 && info.turnImage.size <= 8192 &&
-            sendCmd(Msg.NAVI_NEXT_TURN_INFO, Msgs.navigationInfo(info))
+    override fun setNavigationActive(active: Boolean): Boolean = synchronized(navigationLock) {
+        if (closed.get() || !matchSent) return@synchronized false
+        if (navigationActive == active) return@synchronized true
+        if (!sendCmd(Msg.MODULE_STATUS, Msgs.moduleStatus(1, active))) return@synchronized false
+        navigationActive = active
+        navigationStartedNs = System.nanoTime()
+        navigationShowRequired = true
+        navigationFallbackLogged = false
+        navEpoch.incrementAndGet()
+        SessionDiagnostics.event("CarLife navigation module; active=$active; subscription=${navigationSubscribed ?: "unknown"}")
+        true
+    }
+    override fun sendNavigation(info: HuLink.NavigationInfo): Boolean = synchronized(navigationLock) {
+        if (closed.get() || !matchSent || info.action !in 1..3 || info.turnImage.size > 8192) return@synchronized false
+        if (navigationSubscribed == false) return@synchronized false
+        if (info.action != 3) {
+            if (!setNavigationActive(true)) return@synchronized false
+            if (navigationSubscribed == null) {
+                if (System.nanoTime() - navigationStartedNs < 1_500_000_000L) return@synchronized false
+                if (!navigationFallbackLogged) {
+                    navigationFallbackLogged = true
+                    SessionDiagnostics.event("CarLife navigation subscription not advertised; proceeding after 1500ms; explicit STOP still respected")
+                }
+            }
+        }
+        val outgoing = if (info.action != 3 && navigationShowRequired) info.copy(action = 1) else info
+        val sent = sendCmd(Msg.NAVI_NEXT_TURN_INFO, Msgs.navigationInfo(outgoing))
+        if (sent) navigationShowRequired = outgoing.action == 3
+        sent
+    }
+
+    override fun startMicrophoneProbe(): Boolean = synchronized(microphoneLock) {
+        if (closed.get() || !matchSent || !started) {
+            listener.onDiagnosticStatus("Проверка микрофона: сначала подключитесь к ГУ через CarLife")
+            return@synchronized false
+        }
+        if (probeActive) {
+            listener.onDiagnosticStatus("Проверка микрофона уже выполняется; дождитесь результата или остановите её")
+            return@synchronized false
+        }
+        if (profile.voiceMic == 2) {
+            SessionDiagnostics.event("HU microphone probe refused; VOICE_MIC=2")
+            listener.onDiagnosticStatus("ГУ сообщает VOICE_MIC=2: голосовой вход CarLife не поддерживается")
+            return@synchronized false
+        }
+        probeBytes = 0; probePackets = 0; probePeak = 0; probeMalformed = 0
+        probeStartedNs = System.nanoTime()
+        probeActive = true
+        val revision = ++probeRevision
+        if (!sendCmd(Msg.MIC_RECORD_RECOG_START)) {
+            probeActive = false
+            listener.onDiagnosticStatus("Не удалось отправить запрос микрофона ГУ")
+            return@synchronized false
+        }
+        sendCmd(Msg.MODULE_STATUS, Msgs.moduleStatus(4, true))
+        SessionDiagnostics.event("HU microphone probe started; durationMs=10000; VOICE_MIC=${profile.voiceMic ?: "unknown"}; expectedPcm=16000/mono/s16le; storage=none")
+        listener.onDiagnosticStatus("Микрофон ГУ: проверка 10 секунд. Произнесите несколько слов; запись в файл не ведётся")
+        schedule(3000L) { synchronized(microphoneLock) {
+            if (probeActive && probeRevision == revision) {
+                SessionDiagnostics.event("HU microphone probe progress; packets=$probePackets; bytes=$probeBytes; peak=$probePeak")
+                if (probeBytes == 0L) listener.onDiagnosticStatus("Микрофон ГУ: данных пока нет, ожидаю до конца проверки")
+            }
+        } }
+        schedule(10_000L) { synchronized(microphoneLock) {
+            if (probeActive && probeRevision == revision) finishMicrophoneProbe("время проверки истекло")
+        } }
+        true
+    }
+    override fun stopMicrophoneProbe() { finishMicrophoneProbe("остановлено пользователем") }
+    private fun finishMicrophoneProbe(reason: String) = synchronized(microphoneLock) {
+        if (!probeActive) return@synchronized
+        probeActive = false
+        probeRevision++
+        sendCmd(Msg.MIC_RECORD_END)
+        sendCmd(Msg.MODULE_STATUS, Msgs.moduleStatus(4, false))
+        val elapsedMs = (System.nanoTime() - probeStartedNs) / 1_000_000L
+        SessionDiagnostics.event("HU microphone probe finished; reason=$reason; elapsedMs=$elapsedMs; packets=$probePackets; bytes=$probeBytes; peak=$probePeak; malformed=$probeMalformed; storage=none; assistantConnected=false")
+        val result = when {
+            probeBytes == 0L -> "данные от ГУ не пришли"
+            probePeak == 0 -> "получено $probeBytes байт, сигнал нулевой при интерпретации PCM16"
+            else -> "получено $probeBytes байт, ненулевой сигнал; пик $probePeak (PCM16)"
+        }
+        listener.onDiagnosticStatus("Проверка микрофона: $result. Это ещё не подключение микрофона к Алисе")
+    }
+    private fun onMicrophonePacket(msg: ByteArray) = synchronized(microphoneLock) {
+        if (!probeActive) return@synchronized
+        if (msg.size < 12 || Wire.u32(msg, 8) != Msg.VR_MIC_DATA || Wire.u32(msg, 0) != msg.size - 12) {
+            probeMalformed++; return@synchronized
+        }
+        probePackets++; probeBytes += msg.size - 12
+        for (index in 12 until msg.size - 1 step 2) {
+            val sample = ((msg[index].toInt() and 255) or (msg[index + 1].toInt() shl 8)).toShort().toInt()
+            probePeak = maxOf(probePeak, kotlin.math.abs(sample))
+        }
+    }
 
     override fun sendConfig(csd: ByteArray) {
         this.csd = H264.normalize(csd)
@@ -168,6 +287,7 @@ class CarLifeHuLink internal constructor(
         // Never discard an in-flight packet or resume an H.264 GOP after dropping a delta frame.
         if (packets.bytes > 0 && packets.bytes + data.size + (csd?.size ?: 0) + 64 > MAX_QUEUE_BYTES) {
             val discarded = packets.discardVideo()
+            heartbeatPending.set(false)
             val now = System.nanoTime()
             if (now - lastQueueLogNs > 5_000_000_000L) {
                 lastQueueLogNs = now
@@ -266,6 +386,12 @@ class CarLifeHuLink internal constructor(
                     }
                     output.flush()
                     lastWriteProgressNs.set(System.nanoTime())
+                    completedWireBytes.addAndGet(frame.size.toLong())
+                    writeBusyNs.addAndGet(System.nanoTime() - writeStartedNs)
+                    if (channel == Wire.CH_VIDEO) {
+                        lastVideoCompletedNs.set(System.nanoTime())
+                        if (frame.size > 20 && Wire.u32(frame, 16) == Msg.VIDEO_DATA) completedVideoFrames.incrementAndGet()
+                    }
                     if (channel == Wire.CH_CMD && frame.size >= 16) {
                         val type = Wire.u32(frame, 12)
                         if (type == Msg.MEDIA_INFO || type == Msg.NAVI_NEXT_TURN_INFO)
@@ -285,6 +411,9 @@ class CarLifeHuLink internal constructor(
                             "writtenBytes=$writtenBytes duration_ms=$durationMs")
                     }
                     packets.complete(packet)
+                    if (channel == Wire.CH_VIDEO && frame.size == 20) heartbeatPending.set(false)
+                    writingChannel = -1
+                    writingFrameBytes = 0
                 }
                }
               } finally {
@@ -312,6 +441,7 @@ class CarLifeHuLink internal constructor(
         when (channel) {
             Wire.CH_CMD -> Wire.parseCmd(msg)?.let { onCmd(it.type, it.body) }
             Wire.CH_TOUCH -> Wire.parseCmd(msg)?.let { onTouchMsg(it.type, it.body) }
+            Wire.CH_VR -> onMicrophonePacket(msg)
             Wire.CH_MEDIA -> {
                 if (msg.size >= 12) {
                     val type = Wire.u32(msg, 8)
@@ -346,10 +476,19 @@ class CarLifeHuLink internal constructor(
                 sendCmd(Msg.MD_INFO, Msgs.deviceInfo())
                 schedule(MODULE_STATUS_DELAY_MS) {
                     sendCmd(Msg.MODULE_STATUS, Msgs.moduleStatusList(protoVersion))
+                    synchronized(navigationLock) {
+                        if (navigationActive) sendCmd(Msg.MODULE_STATUS, Msgs.moduleStatus(1, true))
+                    }
+                    synchronized(microphoneLock) {
+                        if (probeActive) sendCmd(Msg.MODULE_STATUS, Msgs.moduleStatus(4, true))
+                    }
                 }
             }
 
-            Msg.HU_INFO -> Log.i(TAG, "HU_INFO ${hex(body, 48)}")
+            Msg.HU_INFO -> {
+                profile.readDevice(body)
+                SessionDiagnostics.event("HU identity; ${profile.summary()}")
+            }
 
             Msg.HU_AUTHEN_REQUEST -> {
                 val random = PbReader.parse(body)?.let { PbReader.str(it, 1) }
@@ -371,18 +510,32 @@ class CarLifeHuLink internal constructor(
             }
 
             Msg.STATISTIC_INFO -> {
+                profile.readStatistics(body)
+                SessionDiagnostics.event("HU compatibility selected; ${profile.summary()}")
                 sendCmd(Msg.MD_AUTHEN_RESULT, Msgs.authenResult(true))
                 sendCmd(Msg.MD_FEATURE_CONFIG_REQUEST)
                 sendCmd(Msg.CAR_DATA_SUBSCRIBE)
             }
 
             Msg.HU_FEATURE_CONFIG_RESPONSE -> {
+                val capabilities = profile.readFeatures(body)
+                SessionDiagnostics.event("HU capabilities; values=$capabilities; voiceMicMeaning=${when (profile.voiceMic) { 0 -> "hu"; 1 -> "phone"; 2 -> "unsupported"; else -> "unknown" }}")
                 Log.i(TAG, "FEATURE_CONFIG ${hex(body, 96)}")
                 SessionDiagnostics.event("HU feature config bytes=${body.size}; data=${hex(body, 192)}")
             }
 
             Msg.CARLIFE_DATA_SUBSCRIBE ->
                 Msgs.subscribeDone(body)?.let { sendCmd(Msg.CARLIFE_DATA_SUBSCRIBE_DONE, it) }
+
+            Msg.CARLIFE_DATA_SUBSCRIBE_START, Msg.CARLIFE_DATA_SUBSCRIBE_STOP -> {
+                val ids = Msgs.subscriptionIds(body)
+                SessionDiagnostics.event("HU metadata subscription; enabled=${type == Msg.CARLIFE_DATA_SUBSCRIBE_START}; modules=${ids ?: "malformed"}")
+                if (ids?.contains(0) == true) synchronized(navigationLock) {
+                    navigationSubscribed = type == Msg.CARLIFE_DATA_SUBSCRIBE_START
+                    navigationShowRequired = true
+                    navEpoch.incrementAndGet()
+                }
+            }
 
             Msg.VIDEO_ENCODER_INIT -> onVideoInit(body)
 
@@ -392,12 +545,15 @@ class CarLifeHuLink internal constructor(
                 paused = true
                 needKey = true
                 val dropped = packets.discardVideo()
+                heartbeatPending.set(false)
                 SessionDiagnostics.event("HU video PAUSE; discardedBytes=$dropped; display and encoder retained")
+                schedule(0L, ::maybeSendVideoKeepalive)
             }
 
             Msg.VIDEO_ENCODER_RESET -> synchronized(videoLock) {
                 needKey = true
                 packets.discardVideo()
+                heartbeatPending.set(false)
                 if (!paused) requestKeyframeOnce()
             }
 
@@ -424,6 +580,9 @@ class CarLifeHuLink internal constructor(
                         // State 1 reports status and never starts playback or capture.
                         sendCmd(Msg.MODULE_STATUS, Msgs.musicStatus(mediaAudioStarted))
                     }
+                }
+                if (module == 1) synchronized(navigationLock) {
+                    sendCmd(Msg.MODULE_STATUS, Msgs.moduleStatus(1, navigationActive))
                 }
             }
             Msg.MD_EXIT -> disconnect("HU sent MD_EXIT")
@@ -487,6 +646,7 @@ class CarLifeHuLink internal constructor(
         lastVideoTxNs = System.nanoTime()
         Log.i(TAG, "video start")
         packets.discardVideo()
+        heartbeatPending.set(false)
         SessionDiagnostics.event("HU video START/resume; awaiting keyframe; display retained")
         if (fallback) listener.onHuReady(videoW, videoH)
         requestKeyframeOnce()
@@ -544,12 +704,36 @@ class CarLifeHuLink internal constructor(
             disconnect("writer stalled for ${WRITE_STALL_TIMEOUT_MS}ms; queuedBytes=$queued")
             return
         }
-        if (started && paused && queued == 0 && System.nanoTime() - lastVideoTxNs >= 2_000_000_000L) {
-            send(Wire.CH_VIDEO, Wire.dataInner(Msg.VIDEO_DATA, unixSeconds(), ByteArray(0)))
-            lastVideoTxNs = System.nanoTime()
-            Log.d(TAG, "PAUSE keepalive: пустой VIDEO_DATA")
+        maybeSendVideoKeepalive()
+        val now = System.nanoTime()
+        val interval = now - lastWireReportNs
+        if (interval >= 10_000_000_000L) {
+            val bytes = completedWireBytes.get()
+            val busy = writeBusyNs.get()
+            SessionDiagnostics.event("CarLife physical write stats; completedBytes=$bytes; wire_kbps=${(bytes - reportedWireBytes) * 8_000_000L / interval}; write_busy_pct=${((busy - reportedBusyNs) * 100 / interval).coerceIn(0L, 100L)}; queuedBytes=${packets.bytes}; videoFrames=${completedVideoFrames.get()}; videoWriteAgeMs=${if (lastVideoCompletedNs.get() == 0L) -1 else (now - lastVideoCompletedNs.get()) / 1_000_000L}; profile=${profile.name}; paused=$paused")
+            lastWireReportNs = now; reportedWireBytes = bytes; reportedBusyNs = busy
         }
-        schedule(1000L, ::keepalive)
+        schedule(100L, ::keepalive)
+    }
+
+    private fun maybeSendVideoKeepalive() = synchronized(videoLock) {
+        if (closed.get() || !started || writingChannel == Wire.CH_VIDEO) return@synchronized
+        val periodMs = when {
+            paused && profile.pauseHeartbeat -> 100L
+            paused -> 2000L
+            profile.idleHeartbeat && completedVideoFrames.get() > 0 -> 1000L
+            else -> return@synchronized
+        }
+        val now = System.nanoTime()
+        val anchor = maxOf(lastVideoTxNs, lastVideoCompletedNs.get())
+        if (now - anchor < periodMs * 1_000_000L || !heartbeatPending.compareAndSet(false, true)) return@synchronized
+        val type = if (profile.pauseHeartbeat || !paused) Msg.VIDEO_HEARTBEAT else Msg.VIDEO_DATA
+        if (send(Wire.CH_VIDEO, Wire.dataInner(type, unixSeconds(), ByteArray(0)))) {
+            lastVideoTxNs = now
+            heartbeatCount++
+            if (heartbeatCount <= 3 || heartbeatCount % 100 == 0L)
+                SessionDiagnostics.event("CarLife keepalive queued; type=0x${type.toString(16)}; periodMs=$periodMs; profile=${profile.name}; paused=$paused; count=$heartbeatCount")
+        } else heartbeatPending.set(false)
     }
 
     private fun requestKeyframeOnce() {

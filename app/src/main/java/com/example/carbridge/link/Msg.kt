@@ -24,6 +24,11 @@ object Msg {
     const val CAR_DATA_SUBSCRIBE = 65585
     const val CARLIFE_DATA_SUBSCRIBE = 98371
     const val CARLIFE_DATA_SUBSCRIBE_DONE = 65604
+    const val CARLIFE_DATA_SUBSCRIBE_START = 0x18045
+    const val CARLIFE_DATA_SUBSCRIBE_STOP = 0x18046
+    const val MIC_RECORD_END = 0x10023
+    const val MIC_RECORD_RECOG_START = 0x10024
+    const val VR_MIC_DATA = 0x58001
     const val HU_AUTHEN_REQUEST = 98376
     const val MD_AUTHEN_RESPONSE = 65609
     const val HU_AUTHEN_RESULT = 98378
@@ -94,6 +99,17 @@ object Msgs {
     fun mediaAudioInit() = PbWriter().int32(1, 48000).int32(2, 2).int32(3, 16).toByteArray()
     fun musicStatus(active: Boolean) = PbWriter().int32(1, 1)
         .bytes(2, PbWriter().int32(1, 3).int32(2, if (active) 1 else 0).toByteArray()).toByteArray()
+    fun moduleStatus(id: Int, active: Boolean) = PbWriter().int32(1, 1)
+        .bytes(2, PbWriter().int32(1, id).int32(2, if (active) 1 else 0).toByteArray()).toByteArray()
+    fun subscriptionIds(body: ByteArray): List<Int>? {
+        val fields = PbReader.parse(body) ?: return null
+        val entries = PbReader.all(fields, 2)
+        if (entries.size > 64) return null
+        return entries.map { entry ->
+            val nested = entry.data?.let(PbReader::parse) ?: return null
+            PbReader.int(nested, 1) ?: return null
+        }.distinct()
+    }
 
     /** Ответ на CARLIFE_DATA_SUBSCRIBE: для каждого id флаг «принято». */
     fun subscribeDone(req: ByteArray): ByteArray? {

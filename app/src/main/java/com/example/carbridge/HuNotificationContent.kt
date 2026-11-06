@@ -13,7 +13,8 @@ import android.widget.TextView
 /** Read published notification content, including custom RemoteViews. No phone-window scraping. */
 internal object HuNotificationContent {
     data class Content(val title: String, val text: String, val icon: Drawable?,
-        val roadSign: Drawable? = null, val speedLimitKmh: Int? = null, val navigationHints: String = "")
+        val roadSign: Drawable? = null, val speedLimitKmh: Int? = null, val navigationHints: String = "",
+        val graphicRole: String = "unknown")
     private val cache=object: LinkedHashMap<String,Content>(64,0.75f,true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,Content>?) = size>64
     }
@@ -33,6 +34,8 @@ internal object HuNotificationContent {
         var roadSign: Drawable? = null
         var explicitLimit: Int? = null
         var icon=runCatching { n.getLargeIcon()?.loadDrawable(context) }.getOrNull()
+        var graphicRole="unknown"
+        var maneuverRank=0
         if(HuMediaNotificationListener.isStrelka(item.packageName) || item.packageName in navigationPackages || n.category==Notification.CATEGORY_NAVIGATION) {
             val custom=n.bigContentView ?: n.contentView ?: n.headsUpContentView
             if(custom!=null) runCatching {
@@ -49,7 +52,15 @@ internal object HuNotificationContent {
                         if(explicitLimit==null) explicitLimit=explicitSpeedLimit(view.text?.toString().orEmpty())
                     }
                     if(view is ImageView) {
-                        if(icon==null) icon=view.drawable
+                        val semantic="$resourceName $description"
+                        val camera=Regex("(?iu)(camera|камер|speed.?trap|speed.?control)").containsMatchIn(semantic)
+                        val maneuver=Regex("(?iu)(maneuv|manoeuv|turn|direction|поворот|ман[её]вр|налево|направо)").containsMatchIn(semantic)
+                        val other=Regex("(?iu)(logo|avatar|background|speed.?limit|road.?sign|traffic.?sign)").containsMatchIn(semantic)
+                        val next=Regex("(?iu)(next.?next|second|after|затем|следующ.*следующ)").containsMatchIn(semantic)
+                        val rank=if(maneuver && !camera && !other) (if(next) 1 else 3) else if(camera) 2 else 0
+                        if(view.drawable!=null && rank>maneuverRank) {
+                            icon=view.drawable; graphicRole=if(camera) "camera" else "maneuver"; maneuverRank=rank
+                        } else if(icon==null && !other) { icon=view.drawable }
                         val signResource=Regex("(?i)(speed_?limit|max_?speed|road_?sign|traffic_?sign)").containsMatchIn(resourceName)
                         val signDescription=Regex("(?iu)(ограничение скорости|дорожный знак|speed limit|road sign|traffic sign)").containsMatchIn(description)
                         if(roadSign==null && (signResource || signDescription)) roadSign=view.drawable
@@ -64,7 +75,9 @@ internal object HuNotificationContent {
         if(title.isBlank() && unique.isNotEmpty()) title=unique.first()
         val text=unique.filter { it!=title }.joinToString("\n").take(3000)
         val limit=explicitLimit ?: explicitSpeedLimit(title+"\n"+text)
-        val content=Content(title.take(512),text,icon,roadSign,limit,navigationHints.distinct().take(20).joinToString("\n"))
+        val cameraText=Regex("(?iu)(камера|контроль скорости|speed camera|speed trap)").containsMatchIn(title+"\n"+text)
+        if(cameraText && graphicRole!="maneuver") graphicRole="camera"
+        val content=Content(title.take(512),text,icon,roadSign,limit,navigationHints.distinct().take(20).joinToString("\n"),graphicRole)
         cache[key]=content
         return content
     }

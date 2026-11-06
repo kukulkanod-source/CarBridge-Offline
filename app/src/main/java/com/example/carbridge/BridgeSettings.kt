@@ -9,6 +9,7 @@ object BridgeSettings {
     const val DISPLAY_MODE_HU = "hu"
     const val DISPLAY_MODE_1600_900 = "1600x900"
     const val DISPLAY_MODE_1920_1080 = "1920x1080"
+    const val DISPLAY_MODE_1920_960 = "1920x960"
     const val DEFAULT_DISPLAY_DPI = 200
     const val DEFAULT_APP_CONTENT_DPI = 200
     val DISPLAY_DPI_OPTIONS: List<Int> = listOf(80, 100, 120, 140, 160, 180, 200, 240, 280, 320)
@@ -144,6 +145,7 @@ object BridgeSettings {
     fun normalizeLogicalDisplayMode(value: String?): String = when (value) {
         DISPLAY_MODE_1600_900 -> DISPLAY_MODE_1600_900
         DISPLAY_MODE_1920_1080 -> DISPLAY_MODE_1920_1080
+        DISPLAY_MODE_1920_960 -> DISPLAY_MODE_1920_960
         else -> DISPLAY_MODE_HU
     }
 
@@ -202,7 +204,7 @@ object BridgeSettings {
     }
 
     fun contentDpiForMode(mode: String): Int = when (normalizeLogicalDisplayMode(mode)) {
-        DISPLAY_MODE_1920_1080 -> 300
+        DISPLAY_MODE_1920_1080, DISPLAY_MODE_1920_960 -> 300
         DISPLAY_MODE_1600_900 -> 250
         else -> 200
     }

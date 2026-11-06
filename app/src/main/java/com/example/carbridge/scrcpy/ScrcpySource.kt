@@ -56,6 +56,8 @@ class ScrcpySource(
         fun onDisplayDensityApplied(dpi: Int) { }
         fun onDisplayEmpty(displayId: Int) { }
         fun onForegroundApp(packageName: String?) { }
+        fun onAssistantStarted(packageName: String) { }
+        fun onAssistantFinished(reason: String) { }
     }
 
     private val context = context.applicationContext
@@ -113,6 +115,7 @@ class ScrcpySource(
     private val pinchReserved = AtomicBoolean(false)
     private val pinchRevision = AtomicLong()
     private val launchRevision = AtomicLong()
+    private val assistantDiagnosticRevision = AtomicLong()
     private val touchEpoch = AtomicLong()
     @Volatile private var activePinch: PinchRun? = null
 
@@ -572,15 +575,50 @@ class ScrcpySource(
                     if (shellCommandFailed(output)) continue
                     requested = true
                     SessionDiagnostics.event("HU wheel assistant start requested; package=${component.packageName}; display=$target; microphone=phone; placementPending=true")
+                    listener.onAssistantStarted(component.packageName)
                     verifyLaunchPlacement(component.packageName, target, token, assistant = true)
+                    diagnoseAssistantMicrophone(component.packageName, target)
                     break
                 }
                 if (!requested) {
+                    listener.onAssistantFinished("launch rejected")
                     SessionDiagnostics.event("HU wheel assistant not resolved or start rejected; display=$target")
                     status("Не найдена доступная Activity голосового ассистента для экрана ГУ")
                 }
-            }.onFailure { status("Не удалось вызвать ассистента: ${it.javaClass.simpleName}") }
+            }.onFailure { listener.onAssistantFinished("launch failed"); status("Не удалось вызвать ассистента: ${it.javaClass.simpleName}") }
         } } catch (_: RejectedExecutionException) { }
+    }
+
+    fun stopAssistantDiagnostics() { assistantDiagnosticRevision.incrementAndGet() }
+
+    private fun diagnoseAssistantMicrophone(pkg: String, target: Int) {
+        val diagnostic = assistantDiagnosticRevision.incrementAndGet()
+        for (delay in listOf(1000L, 3000L, 8000L, 15000L, 25000L, 40000L, 60000L, 85000L)) controls.schedule({
+            if (closed.get() || appDisplay() != target || assistantDiagnosticRevision.get() != diagnostic) return@schedule
+            try { displayCommands.execute {
+                if (closed.get() || appDisplay() != target || assistantDiagnosticRevision.get() != diagnostic) return@execute
+                runCatching {
+                    if (delay >= 8000L) {
+                        val snapshot = runShellCommand(HuWindowSnapshot.COMMAND)
+                        val foreground = HuWindowSnapshot.foregroundPackage(snapshot, target)
+                        if (foreground != null && foreground != pkg) {
+                            assistantDiagnosticRevision.compareAndSet(diagnostic, diagnostic + 1)
+                            listener.onAssistantFinished("assistant left HU foreground")
+                            return@runCatching
+                        }
+                    }
+                    val report = runShellCommand("cmd appops get --user current ${shellArgument(pkg)} RECORD_AUDIO")
+                    val accessMode = Regex("RECORD_AUDIO:\\s*(allow|foreground|ignore|deny|default|errored)")
+                        .find(report)?.groupValues?.get(1) ?: "not_reported"
+                    val runningMarker = report.contains("(running)", ignoreCase = true)
+                    SessionDiagnostics.event("HU assistant microphone access; package=$pkg; afterMs=$delay; mode=$accessMode; runningMarker=$runningMarker; queryFailed=${shellCommandFailed(report)}")
+                    // Only the current recorder section, never recording event history or a full dump in logs.
+                    val recorders = runShellCommand(AssistantRecordingDiagnostics.COMMAND)
+                    val summary = AssistantRecordingDiagnostics.summary(recorders, pkg)
+                    SessionDiagnostics.event("HU assistant recording route; package=$pkg; afterMs=$delay; $summary")
+                }.onFailure { SessionDiagnostics.event("HU assistant microphone diagnostics failed: ${it.javaClass.simpleName}") }
+            } } catch (_: RejectedExecutionException) { }
+        }, delay, TimeUnit.MILLISECONDS)
     }
 
     /** Settings are launched on the HU display, never by expanding the phone's shade. */

@@ -92,7 +92,88 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
     private var audioHuReadyAt = Long.MAX_VALUE
     private var audioSuspended = false
     private var audioRetryAt = 0L
+    private var audioIdleSince = 0L
     private var audioFailures = 0
+    private var audioLastFailureAt = 0L
+    private var audioWarmupRequested = false
+    private var audioSuspendedByHu = false
+    private var audioHuSuspendedAt = -20000L
+    private var audioBeforeHuSuspend = false
+    private var audioCallRecoveryPending = false
+    private var observedAudioMode = AudioManager.MODE_NORMAL
+    private var audioModeListener: AudioManager.OnModeChangedListener? = null
+
+    private fun observeAudioMode(value: Int) {
+        if(observedAudioMode==value) return
+        val old=observedAudioMode
+        observedAudioMode=value
+        if(!sessionActive || !connectionSettings.usbAudio) return
+        val now=SystemClock.elapsedRealtime()
+        if(value!=AudioManager.MODE_NORMAL) {
+            if(usbAudioSource!=null || (audioBeforeHuSuspend && now-audioHuSuspendedAt in 0L..10000L))
+                audioCallRecoveryPending=true
+        } else if(audioCallRecoveryPending) {
+            audioCallRecoveryPending=false
+            // Recover a call-interrupted route, not an arbitrary HU source change
+            // or a source explicitly disabled after repeated capture failures.
+            if(audioFailures<3 && (!audioSuspended || audioSuspendedByHu)) {
+                audioSuspended=false; audioSuspendedByHu=false
+                audioRetryAt=0L; audioWarmupRequested=true
+                SessionDiagnostics.event("USB audio call-mode ended; routing recovery requested; previousMode=$old")
+            }
+        }
+        SessionDiagnostics.event("USB audio mode changed; from=$old; to=$value; callRecovery=$audioCallRecoveryPending; huSuspended=$audioSuspendedByHu")
+    }
+    private var assistantAudioUntil = 0L
+    private var assistantAudioStartedAt = 0L
+    private var assistantAudioPackage: String? = null
+    private var assistantRecordingObserverRegistered = false
+    private var lastAssistantRecordingState = "<unset>"
+    private val assistantRecordingObserver = object : AudioManager.AudioRecordingCallback() {
+        override fun onRecordingConfigChanged(configs: MutableList<android.media.AudioRecordingConfiguration>?) {
+            if (sessionActive && assistantAudioUntil > SystemClock.elapsedRealtime()) logAssistantRecorders(configs.orEmpty())
+        }
+    }
+
+    private fun beginAssistantAudio(packageName: String? = null) {
+        assistantAudioStartedAt = SystemClock.elapsedRealtime()
+        assistantAudioUntil = assistantAudioStartedAt + 90000L
+        assistantAudioPackage = packageName
+        audioIdleSince = 0L
+        if (!assistantRecordingObserverRegistered) {
+            runCatching {
+                getSystemService(AudioManager::class.java).registerAudioRecordingCallback(assistantRecordingObserver, main)
+                assistantRecordingObserverRegistered = true
+            }.onFailure { SessionDiagnostics.event("HU recording observer unavailable: ${it.javaClass.simpleName}") }
+        }
+        SessionDiagnostics.event("USB assistant audio hold; timeoutMs=90000; package=${packageName ?: "resolving"}; microphone=phone")
+        logAssistantRecorders(runCatching { getSystemService(AudioManager::class.java).activeRecordingConfigurations }.getOrDefault(emptyList()))
+        updateUsbAudio()
+    }
+
+    private fun endAssistantAudio(reason: String) {
+        if (assistantAudioUntil == 0L) return
+        assistantAudioUntil = 0L
+        assistantAudioPackage = null
+        adbSource?.stopAssistantDiagnostics()
+        if (assistantRecordingObserverRegistered) runCatching {
+            getSystemService(AudioManager::class.java).unregisterAudioRecordingCallback(assistantRecordingObserver)
+        }
+        assistantRecordingObserverRegistered = false
+        lastAssistantRecordingState = "<unset>"
+        audioIdleSince = 0L
+        SessionDiagnostics.event("USB assistant audio hold released; reason=$reason")
+    }
+
+    private fun logAssistantRecorders(configs: List<android.media.AudioRecordingConfiguration>) {
+        val summary = configs.take(8).joinToString("; ") { config ->
+            val device = runCatching { config.audioDevice?.type?.toString() ?: "unknown" }.getOrDefault("unknown")
+            "session=${config.clientAudioSessionId} source=${config.clientAudioSource} deviceType=$device silenced=${config.isClientSilenced}"
+        }
+        if (summary == lastAssistantRecordingState) return
+        lastAssistantRecordingState = summary
+        SessionDiagnostics.event("HU recording inputs; identity=anonymized; count=${configs.size}; configs=[$summary]")
+    }
     private val carLifeMetadata by lazy { com.example.carbridge.HuCarLifeMediaMetadata(applicationContext) }
     private val carLifeNavigation by lazy { com.example.carbridge.HuCarLifeNavigation(applicationContext) }
     private var strelkaDiagnosticAt = -30000L
@@ -132,12 +213,16 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
                 accepted
             },
             onInputKey = { adbSource?.sendKey(it) },
-            onNotificationOpen = { openNotificationOnHu(it) })
+            onNotificationOpen = { openNotificationOnHu(it) },
+            onNavigationCueVisibility = { mediaOverlay.setNavigationVisible(it) })
     }
     private val mediaOverlay: HuMediaOverlay by lazy {
         HuMediaOverlay(applicationContext,
             onDismissPanel = { setMediaCardVisible(false) },
-            onOpenMediaSource = { packageName -> openMediaSourceOnPhone(packageName) },
+            onOpenMediaSource = { packageName -> openMediaSourceOnHu(packageName) },
+            onNavigationPlacementChanged = { right, height, inset ->
+                navigation.setNavigationCardPlacement(right,height,inset)
+            },
             onLayoutChanged = { visible, right ->
                 navigation.setMediaVisible(visible)
                 contentPresentation?.setMusicLayout(visible && connectionSettings.resizeForMusic, right)
@@ -217,6 +302,15 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
             addAction(Intent.ACTION_USER_PRESENT)
         }, ContextCompat.RECEIVER_NOT_EXPORTED)
         getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, main)
+        if(Build.VERSION.SDK_INT>=31) {
+            val listener=AudioManager.OnModeChangedListener { value ->
+                observeAudioMode(value)
+                if(sessionActive) updateUsbAudio()
+            }
+            runCatching { getSystemService(AudioManager::class.java).addOnModeChangedListener(mainExecutor,listener) }
+                .onSuccess { audioModeListener=listener }
+                .onFailure { SessionDiagnostics.event("USB audio mode observer unavailable: ${it.javaClass.simpleName}") }
+        }
         getSystemService(PowerManager::class.java).addThermalStatusListener(
             java.util.concurrent.Executor { command -> main.post(command); Unit }, thermalStatusListener)
     }
@@ -264,6 +358,18 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
                 if (link == null) stopSelf()
                 return START_NOT_STICKY
             }
+            ACTION_MICROPHONE_PROBE, ACTION_MICROPHONE_PROBE_STOP -> {
+                val active = link
+                if (intent.action == ACTION_MICROPHONE_PROBE_STOP) {
+                    active?.stopMicrophoneProbe()
+                } else if (active == null || !usingUsb) {
+                    publishStatus("Проверка микрофона: сначала подключитесь к ГУ по USB CarLife")
+                } else if (!active.startMicrophoneProbe()) {
+                    publishStatus("Проверка микрофона не запущена; подробности в статусе подключения и журнале")
+                }
+                if (link == null && !sessionActive) stopSelf()
+                return START_NOT_STICKY
+            }
             ACTION_METADATA_MODE -> {
                 val settings = BridgeSettings.read(this)
                 connectionSettings = connectionSettings.copy(carLifeNavigation = settings.carLifeNavigation,
@@ -276,6 +382,8 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
             ACTION_AUDIO_MODE -> {
                 connectionSettings = connectionSettings.copy(usbAudio = BridgeSettings.read(this).usbAudio)
                 audioSuspended = false; audioFailures = 0; audioRetryAt = 0L
+                audioSuspendedByHu=false; audioCallRecoveryPending=false
+                audioWarmupRequested=connectionSettings.usbAudio
                 updateUsbAudio()
                 publishStatus(if (connectionSettings.usbAudio) "USB-звук включён: запустите музыку при активном USB CarLife"
                     else "USB-звук выключен; звук телефона/Bluetooth восстановлен")
@@ -359,6 +467,9 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
         thermalStatusListener.onThermalStatusChanged(getSystemService(PowerManager::class.java).currentThermalStatus)
         announcedDisplay = false
         audioSuspended = false; audioFailures = 0; audioRetryAt = 0L; audioHuReadyAt = Long.MAX_VALUE
+        audioSuspendedByHu=false; audioCallRecoveryPending=false; audioBeforeHuSuspend=false
+        audioHuSuspendedAt=-20000L; audioLastFailureAt=0L; audioWarmupRequested=settings.usbAudio
+        observedAudioMode=getSystemService(AudioManager::class.java).mode
         main.removeCallbacks(audioPoll); main.post(audioPoll)
         OfflineDisconnectMonitor.cancel()
         SessionDiagnostics.start(applicationContext,
@@ -398,12 +509,18 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
                 this@CaptureService.onTouch(event)
             }
             override fun onHardKey(code: Int) = active { this@CaptureService.onHardKey(code) }
+            override fun onDiagnosticStatus(message: String) = active { publishStatus(message) }
             override fun onAudioSuspend() = active {
+                audioBeforeHuSuspend=usbAudioSource!=null
+                audioHuSuspendedAt=SystemClock.elapsedRealtime()
                 audioSuspended = true
+                audioSuspendedByHu=true
+                endAssistantAudio("HU selected another audio source")
                 stopUsbAudio("HU selected another audio source or paused")
             }
             override fun onAudioResume() = active {
                 audioSuspended = false
+                audioSuspendedByHu=false; audioWarmupRequested=true
                 updateUsbAudio()
             }
             override fun onTransportBackpressure(queuedBytes: Int) = active {
@@ -435,12 +552,35 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
     private fun updateUsbAudio() {
         val activeLink = link
         val now = SystemClock.elapsedRealtime()
+        val audioMode = getSystemService(AudioManager::class.java).mode
+        observeAudioMode(audioMode)
         val wanted = connectionSettings.usbAudio && usingUsb && mode == MODE_ADB && receivedFrame &&
             Build.VERSION.SDK_INT >= 31 && !audioSuspended && now >= audioHuReadyAt && activeLink != null
-        if (!wanted || !playbackActive()) {
-            if (usbAudioSource != null) stopUsbAudio(if (wanted) "playback idle or call" else "disabled or transport unavailable")
+        if (assistantAudioUntil != 0L && now >= assistantAudioUntil) endAssistantAudio("90s deadline")
+        if (audioMode != AudioManager.MODE_NORMAL) endAssistantAudio("audio mode=$audioMode")
+        val assistantActive = assistantAudioUntil > now
+        if (!wanted || audioMode != AudioManager.MODE_NORMAL) {
+            if (usbAudioSource != null) stopUsbAudio(if (wanted) "audio mode=$audioMode" else "disabled or transport unavailable")
+            audioIdleSince = 0L
             return
         }
+        if (!assistantActive && !playbackActive()) {
+            val current = usbAudioSource
+            // Startup has its own 20s deadline. A brief pause between speech phrases
+            // must not repeatedly tear down the output route or cancel startup.
+            if(current==null) {
+                if(!audioWarmupRequested) { audioIdleSince=0L; return }
+            } else if(!current.captureReady) { audioIdleSince=0L; return }
+            else {
+              if (audioIdleSince == 0L) {
+                audioIdleSince = now
+                SessionDiagnostics.event("USB audio idle grace started; timeoutMs=60000; mode=$audioMode")
+              }
+              if (now - audioIdleSince >= 60000) stopUsbAudio("playback idle after 60s grace")
+              return
+            }
+        }
+        audioIdleSince = 0L
         if (usbAudioSource != null || now < audioRetryAt || activeLink == null) return
         val currentGeneration = generation
         var source: ScrcpyAudioSource? = null
@@ -457,9 +597,12 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
             override fun onError(message: String) {
                 if (usbAudioSource !== source || generation != currentGeneration) return
                 stopUsbAudio("capture failed: $message")
+                val failedAt=SystemClock.elapsedRealtime()
+                if(failedAt-audioLastFailureAt>60000L) audioFailures=0
+                audioLastFailureAt=failedAt
                 audioFailures++
                 audioRetryAt = SystemClock.elapsedRealtime() + 10000
-                if (audioFailures >= 3) audioSuspended = true
+                if (audioFailures >= 3) { audioSuspended = true; audioSuspendedByHu=false }
                 SessionDiagnostics.event("USB audio failed; attempts=$audioFailures; video retained; error=$message")
                 publishStatus("USB-звук: $message. Видео продолжает работать. " +
                     if (audioSuspended) "Повторить — выключите и включите USB-звук в настройках." else "Повтор через 10 секунд.")
@@ -467,11 +610,14 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
         })
         usbAudioSource = source
         usbAudioLink = activeLink
-        SessionDiagnostics.event("USB audio starting; independent shell output capture; playback active")
+        val warmup=audioWarmupRequested
+        audioWarmupRequested=false
+        SessionDiagnostics.event("USB audio starting; independent shell output capture; reason=${if (assistantActive) "assistant dialogue" else if(warmup) "connection or call recovery warmup" else "playback active"}")
         source.start()
     }
 
     private fun stopUsbAudio(reason: String) {
+        audioIdleSince = 0L
         val source = synchronized(usbAudioLock) {
             usbAudioSource.also {
                 usbAudioSource = null
@@ -485,7 +631,9 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
 
     private fun handleCarLifeDisconnect(activeLink: HuLink, reason: String) {
         if (link !== activeLink || !sessionActive) return
+        audioCallRecoveryPending=false; audioWarmupRequested=false
         audioHuReadyAt = Long.MAX_VALUE
+        endAssistantAudio("CarLife disconnected")
         stopUsbAudio("CarLife disconnected")
         val transport = if (usingWifiCarLife) "wifi" else if (usingUsb) "usb" else "unknown"
         SessionDiagnostics.event("CaptureService received HU disconnect; transport=$transport; reason=$reason")
@@ -653,6 +801,8 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
                     val logicalSize = when (sourceSettings.logicalDisplayMode) {
                         BridgeSettings.DISPLAY_MODE_1920_1080 ->
                             if (width == 1280 && height == 720) 1920 to 1080 else width to height
+                        BridgeSettings.DISPLAY_MODE_1920_960 ->
+                            if (width == 1280 && height == 640) 1920 to 960 else width to height
                         BridgeSettings.DISPLAY_MODE_1600_900 ->
                             if (width % 4 == 0 && height % 4 == 0 &&
                                 width.toLong() * 5L / 4L <= 65535L && height.toLong() * 5L / 4L <= 65535L)
@@ -665,7 +815,8 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
                     val maxVideoSize = if (canScaleLogicalDisplay) maxOf(width, height) else null
                     if (sourceSettings.logicalDisplayMode != BridgeSettings.DISPLAY_MODE_HU && !canScaleLogicalDisplay) {
                         SessionDiagnostics.event("Logical display mode=${sourceSettings.logicalDisplayMode} not applied: unsupported HU frame=${width}x$height")
-                        publishStatus("Экспериментальный размер не применён: режим ГУ ${width}×${height} несовместим с выбранным профилем")
+                        publishStatus("Размер не применён: ГУ ${width}×${height}. " +
+                            if(width==1280 && height==640) "Выберите 1920×960 / 300 DPI и переподключитесь." else "Выберите профиль с такими же пропорциями и переподключитесь.")
                     }
                     SessionDiagnostics.event("HU video=${width}x$height; ui_dpi=${sourceSettings.displayDpi}; " +
                         "virtual_display=${logicalWidth}x$logicalHeight; display_mode=${sourceSettings.logicalDisplayMode}; " +
@@ -753,9 +904,17 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
                                     }
                                 }
                             }
+                            override fun onAssistantStarted(packageName: String) {
+                                main.post { if (generation == currentGeneration && link === session) beginAssistantAudio(packageName) }
+                            }
+                            override fun onAssistantFinished(reason: String) {
+                                main.post { if (generation == currentGeneration && link === session) endAssistantAudio(reason) }
+                            }
                             override fun onForegroundApp(packageName: String?) {
                                 main.post {
                                     if (generation == currentGeneration && link === session) {
+                                        if (packageName != null && assistantAudioPackage != null && packageName != assistantAudioPackage &&
+                                            SystemClock.elapsedRealtime() - assistantAudioStartedAt >= 5000L) endAssistantAudio("foreground app changed")
                                         navigation.setForegroundPackage(if (homePresentation?.isShowing == true)
                                             applicationContext.packageName else packageName)
                                     }
@@ -833,13 +992,29 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
             SessionDiagnostics.event("HU hard key=$code; action dispatch; display=${AppDisplayState.displayId}")
             when (code) {
                 15, 16, 31, 32 -> mediaOverlay.dispatchWheelMedia(code)
-                33 -> { dismissHomePresentation(); adbSource?.launchVoiceAssistant() }
+                33 -> {
+                    link?.stopMicrophoneProbe()
+                    dismissHomePresentation()
+                    logAssistantAudioState("before launch")
+                    if (adbSource != null) beginAssistantAudio()
+                    adbSource?.launchVoiceAssistant()
+                    for (delay in listOf(3000L, 10000L)) main.postDelayed({
+                        if (sessionActive && generation == token) logAssistantAudioState("after ${delay}ms")
+                    }, delay)
+                }
                 14 -> handleHuBack()
                 30 -> showHomeScreen()
             }
         }
     }
     private var lastUnknownWheelAt = -10000L
+    private fun logAssistantAudioState(stage: String) {
+        runCatching {
+            val audio = getSystemService(AudioManager::class.java)
+            val inputs = audio.getDevices(AudioManager.GET_DEVICES_INPUTS).map { it.type }.distinct().sorted()
+            SessionDiagnostics.event("HU assistant audio state; stage=$stage; mode=${audio.mode}; microphoneMuted=${audio.isMicrophoneMute}; musicActive=${audio.isMusicActive}; inputTypes=$inputs; usbCapture=${usbAudioSource != null}; captureReady=${usbAudioSource?.captureReady == true}; huMicrophone=false")
+        }.onFailure { SessionDiagnostics.event("HU assistant audio diagnostics unavailable: ${it.javaClass.simpleName}") }
+    }
     override fun onRequestKeyframe() { adbSource?.requestKeyframe(); main.post { mirror?.requestKeyframe() } }
     override fun onHuDisconnected(reason: String) { main.post {
         publishStatus("CarLife отключилось: ${reason.take(140)}")
@@ -911,10 +1086,12 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
     private fun showNavigation() {
         if (mode != MODE_ADB || adbSource == null) return
         val id = AppDisplayState.displayId
-        val shown = navigation.show(id, connectionSettings.displayDpi, huWidth, connectionSettings.dockAutoHide)
+        val shown = navigation.show(id, connectionSettings.displayDpi, huWidth, connectionSettings.dockAutoHide,
+            connectionSettings.resizeForMusic)
         navigation.setPhoneVisible(phonePanel.visible)
         val mediaShown = mediaOverlay.show(id, connectionSettings.displayDpi, huWidth,
             connectionSettings.resizeForMusic, !connectionSettings.dockAutoHide)
+        mediaOverlay.setNavigationVisible(navigation.isNavigationCueVisible())
         navigation.setMediaVisible(mediaOverlay.isVisible())
         contentPresentation?.setMusicLayout(mediaOverlay.isVisible() && connectionSettings.resizeForMusic, mediaOverlay.isOnRight())
         if (!shown) SessionDiagnostics.event("Independent HU navigation requires overlay permission and a valid display id")
@@ -986,6 +1163,7 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
     }
 
     private fun showHomeScreen() {
+        endAssistantAudio("CarBridge home opened")
         adbSource?.cancelLaunchPlacement()
         closeApplications()
         setMediaCardVisible(false)
@@ -1054,6 +1232,7 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
 
     /** Launch the selected app full-screen on the HU's scrcpy display. */
     private fun launchSelectedApp(packageName: String, launcherComponent: ComponentName? = null) {
+        if (assistantAudioUntil != 0L && packageName != assistantAudioPackage) endAssistantAudio("another app selected")
         val source = adbSource ?: return
         dismissHomePresentation()
         selectedPackage = packageName
@@ -1091,19 +1270,13 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
     private fun closedService(): Boolean = !sessionActive
 
     /** Reopen the last media source on the phone without replacing navigation on the HU display. */
-    private fun openMediaSourceOnPhone(packageName: String) {
-        val intent = packageManager.getLaunchIntentForPackage(packageName)?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        if (intent == null) {
-            publishStatus("Не удалось открыть музыкальное приложение $packageName")
+    private fun openMediaSourceOnHu(packageName: String) {
+        if(mode!=MODE_ADB || adbSource==null || applicationDisplayId<=0) {
+            publishStatus("Виртуальный дисплей не готов для восстановления музыки")
             return
         }
-        try {
-            startActivity(intent, ActivityOptions.makeBasic()
-                .setLaunchDisplayId(Display.DEFAULT_DISPLAY).toBundle())
-            publishStatus("Открываю ${packageManager.getApplicationLabel(packageManager.getApplicationInfo(packageName, 0))} на телефоне для восстановления медиасессии")
-        } catch (error: Exception) {
-            publishStatus("Не удалось повторно открыть музыку: ${error.message?.take(120) ?: error.javaClass.simpleName}")
-        }
+        launchSelectedApp(packageName)
+        SessionDiagnostics.event("HU media source recovery launch; package=$packageName; display=$applicationDisplayId")
     }
 
     private fun showApplications() {
@@ -1169,6 +1342,7 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
     private fun shutdown(checkLocalAdbAfterUsb: Boolean = false) {
         val wasActive = sessionActive
         sessionActive = false
+        endAssistantAudio("session shutdown")
         main.removeCallbacks(audioPoll)
         carLifeNavigation.update(null, false)
         carLifeMetadata.update(null)
@@ -1210,6 +1384,10 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
     }
 
     override fun onDestroy() {
+        if(Build.VERSION.SDK_INT>=31) audioModeListener?.let { listener ->
+            runCatching { getSystemService(AudioManager::class.java).removeOnModeChangedListener(listener) }
+        }
+        audioModeListener=null
         unregisterReceiver(usbReceiver)
         unregisterReceiver(screenReceiver)
         getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener)
@@ -1245,6 +1423,8 @@ class CaptureService : Service(), HuLink.Listener, ScreenSource.Listener {
         const val ACTION_APPLY_DPI = "carbridge.APPLY_DPI"
         const val ACTION_SHOW_HOME = "carbridge.SHOW_HOME"
         const val ACTION_METADATA_MODE = "carbridge.METADATA_MODE"
+        const val ACTION_MICROPHONE_PROBE = "carbridge.MICROPHONE_PROBE"
+        const val ACTION_MICROPHONE_PROBE_STOP = "carbridge.MICROPHONE_PROBE_STOP"
         const val ACTION_AUDIO_MODE = "carbridge.AUDIO_MODE"
         const val ACTION_REFRESH_NAV = "carbridge.REFRESH_NAV"
         const val EXTRA_COMPONENT = "component"

@@ -193,6 +193,31 @@ internal class AdbOperationRunner(
         }
     }
 
+    /** Keep the slot occupied until transport cleanup ends, so it cannot close a later session. */
+    fun cancel(message: String) {
+        val task = synchronized(lock) {
+            val active = current ?: return
+            if (!active.active) return
+            active.active = false
+            snapshot = snapshot.copy(revision = ++serial, message = "Отменяю подготовку…", busy = true)
+            active
+        }
+        onState(state())
+        cancellation.execute {
+            task.deadline?.cancel(false)
+            task.future?.cancel(true)
+            try { cancelTransport() }
+            finally {
+                val next = synchronized(lock) {
+                    if (current !== task) return@execute
+                    current = null
+                    snapshot.copy(revision = ++serial, message = message, busy = false).also { snapshot = it }
+                }
+                onState(next)
+            }
+        }
+    }
+
     override fun close() {
         worker.shutdownNow()
         timer.shutdownNow()

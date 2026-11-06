@@ -21,6 +21,8 @@ internal class HuCarLifeNavigation(private val context: Context) {
     private var missingAt = 0L
     private var diagnosticAt = -30000L
     private var diagnosticReason = ""
+    private var observedGuidanceAt = -1L
+    private var sentEpoch = -1L
     private val icons = HashMap<Int, ByteArray>()
     private data class Turn(val code: Int, val meters: Int, val road: String, val source: String)
     private data class Parsed(val turn: Turn?, val reason: String)
@@ -29,6 +31,7 @@ internal class HuCarLifeNavigation(private val context: Context) {
         if (link !== lastLink) {
             clear(lastLink, "connection changed")
             previous = null; total = 0; sentAt = 0L; missingAt = 0L
+            observedGuidanceAt = -1L; sentEpoch = -1L
             lastLink = link
         }
         if (link == null) return
@@ -40,46 +43,61 @@ internal class HuCarLifeNavigation(private val context: Context) {
         }
         if (candidates.isEmpty()) HuMediaNotificationListener.requestSnapshotRefresh()
         var parsed = Parsed(null, if (HuMediaNotificationListener.connected) "no navigation notification" else "listener disconnected")
+        var guidanceEvidence = false
         for (item in candidates) {
             val result = runCatching {
                 val content = HuNotificationContent.read(context, item)
-                if (HuNotificationContent.isNavigation(item, content)) parse(content, item.packageName)
+                if (HuNotificationContent.isNavigation(item, content)) {
+                    // Recognizing an explicit instruction can establish route activity even
+                    // when its distance is ambiguous. It never invents a turn packet.
+                    if ((listOf(content.title) + content.text.lines() + content.navigationHints.lines()).any { direction(it) != null })
+                        guidanceEvidence = true
+                    parse(content, item.packageName)
+                }
                 else Parsed(null, "not an active guidance notification")
             }.getOrElse { Parsed(null, "notification decode failed") }
             parsed = result
             if (result.turn != null) break
         }
         val turn = parsed.turn
+        if (guidanceEvidence || turn != null) observedGuidanceAt = now
+        val routePresent = observedGuidanceAt >= 0 && now - observedGuidanceAt < 2000
         if (turn == null) {
+            if (previous == null) link.setNavigationActive(routePresent)
             if (now - diagnosticAt >= 30000 || diagnosticReason != parsed.reason) {
                 diagnosticAt = now; diagnosticReason = parsed.reason
                 SessionDiagnostics.event("CarLife navigation waiting; reason=${parsed.reason}; candidates=${candidates.size}; published=${published.size}; summaries=${published.count { it.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0 }}")
             }
             if (previous != null) {
                 if (missingAt == 0L) missingAt = now
-                if (now - missingAt >= 2000) clear(link, parsed.reason)
+                if (now - missingAt >= 2000) clear(link, parsed.reason, keepRoute = routePresent)
             }
             return
         }
         missingAt = 0L
+        if (!link.setNavigationActive(true)) return
+        val epoch = link.navigationEpoch
         val old = previous
-        val newLeg = old == null || old.source != turn.source || old.code != turn.code || old.road != turn.road ||
+        val newLeg = sentEpoch != epoch || old == null || old.source != turn.source || old.code != turn.code || old.road != turn.road ||
             turn.meters > old.meters + 50
-        if (turn == old && now - sentAt < 5000) return
+        if (turn == old && sentEpoch == epoch && now - sentAt < 5000) return
         val nextTotal = if (newLeg) turn.meters else maxOf(total, turn.meters)
         val info = HuLink.NavigationInfo(if (newLeg) 1 else 2, turn.code, turn.road,
             nextTotal, turn.meters, icons.getOrPut(turn.code) { drawIcon(turn.code) })
         if (link.sendNavigation(info)) {
             previous = turn; total = nextTotal; sentAt = now
+            sentEpoch = epoch
             SessionDiagnostics.event("CarLife navigation queued; action=${info.action}; turn=${turn.code}; meters=${turn.meters}; roadPresent=${turn.road.isNotBlank()}; iconBytes=${info.turnImage.size}; source=${turn.source}")
         }
     }
 
-    private fun clear(link: HuLink?, reason: String) {
+    private fun clear(link: HuLink?, reason: String, keepRoute: Boolean = false) {
         if (previous != null && link != null) {
-            if (!link.sendNavigation(HuLink.NavigationInfo(3, 24, "", 0, 0))) return
-            SessionDiagnostics.event("CarLife navigation cleared; action=3; reason=$reason; queued=true")
+            val queued = link.sendNavigation(HuLink.NavigationInfo(3, 24, "", 0, 0))
+            SessionDiagnostics.event("CarLife navigation cleared; action=3; reason=$reason; queued=$queued")
         }
+        link?.setNavigationActive(keepRoute)
+        if (!keepRoute) observedGuidanceAt = -1L
         previous = null; total = 0; sentAt = 0L; missingAt = 0L
     }
 

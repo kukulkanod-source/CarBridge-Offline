@@ -26,8 +26,8 @@ internal object PairingPrompt {
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Подготовка подключения", NotificationManager.IMPORTANCE_HIGH))
         val mutable = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
-        val reply = PendingIntent.getBroadcast(context, ID,
-            Intent(context, PairingCodeReceiver::class.java).setAction("${context.packageName}.PAIR_CODE"),
+        val reply = PendingIntent.getForegroundService(context, ID,
+            Intent(context, ConnectionPreparationService::class.java).setAction(ConnectionPreparationService.ACTION_CODE),
             PendingIntent.FLAG_UPDATE_CURRENT or mutable)
         val open = PendingIntent.getActivity(context, ID,
             Intent(context, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -37,7 +37,7 @@ internal object PairingPrompt {
             .setContentTitle("Сопряжение CarBridge")
             .setContentText(message ?: "Откройте окно с кодом Android и введите код здесь")
             .setStyle(Notification.BigTextStyle().bigText(message ?: "В разделе «Беспроводная отладка» откройте окно с кодом. Нажмите «Ввести код» в этом уведомлении, оставив окно Android открытым."))
-            .setContentIntent(open).setOnlyAlertOnce(true).addAction(action).build()
+            .setContentIntent(open).setOnlyAlertOnce(true).setOngoing(true).addAction(action).build()
         runCatching { manager.notify(ID, notification) }
     }
     fun hide(context: Context) { context.getSystemService(NotificationManager::class.java).cancel(ID) }

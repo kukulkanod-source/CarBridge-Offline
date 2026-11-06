@@ -47,6 +47,12 @@ internal class ConnectionWizardView(
         setOnClickListener { val secret = code.text.toString().trim(); code.text.clear(); submit(secret) }
     }
     private val ports = text("", 13f)
+    private var expanded = false
+    private val advanced = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+    private val advancedButton = Button(context).apply {
+        text = "Дополнительно: ввод кода в приложении и ручная настройка"
+        setOnClickListener { expanded = !expanded; advanced.visibility = if(expanded) View.VISIBLE else View.GONE }
+    }
     private val notificationAccess = Button(context).apply {
         text = "Разрешить уведомление для ввода кода"
         setOnClickListener { allowPairNotification() }
@@ -59,7 +65,7 @@ internal class ConnectionWizardView(
     private val stopButton = Button(context).apply { text = "Остановить соединение"; setOnClickListener { stop() } }
     init {
         body.addView(heading)
-        body.addView(text("CarBridge проверяет пункты по очереди. Выполните подсказку текущего шага — после возврата проверка продолжится сама.", 15f))
+        body.addView(text("CarBridge проверяет пункты по очереди. Выполните подсказку текущего шага — мастер продолжит проверку даже пока открыты настройки Android.", 15f))
         ConnectionWizard.Step.entries.forEach { step ->
             rows[step] = text("○  ${step.label}", 17f)
         }
@@ -67,14 +73,17 @@ internal class ConnectionWizardView(
         body.addView(instruction)
         primary.setOnClickListener { action(currentAction) }
         body.addView(primary)
-        body.addView(connectPortButton)
-        pairControls.addView(code)
-        pairControls.addView(pairButton)
-        pairControls.addView(ports)
+        advanced.addView(connectPortButton)
+        pairControls.addView(text("Введите код в уведомлении CarBridge, оставив окно Android открытым. Адрес и порты будут найдены автоматически.", 15f))
         pairControls.addView(notificationAccess)
-        pairControls.addView(text("Если окно Android закрывается при переходе сюда, используйте кнопку «Ввести код» в уведомлении CarBridge. Для этого разрешите уведомления CarBridge на телефоне.", 14f))
-        pairControls.addView(Button(context).apply { text = "Указать адрес и порты вручную"; setOnClickListener { manual() } })
         body.addView(pairControls)
+        body.addView(advancedButton)
+        advanced.addView(code)
+        advanced.addView(pairButton)
+        advanced.addView(ports)
+        advanced.addView(text("Если окно Android закрывается при переходе сюда, используйте кнопку «Ввести код» в уведомлении CarBridge. Для этого разрешите уведомления CarBridge на телефоне.", 14f))
+        advanced.addView(Button(context).apply { text = "Указать адрес и порты вручную"; setOnClickListener { manual() } })
+        body.addView(advanced)
         body.addView(text("Готовность телефона", 18f))
         rows.values.forEach { body.addView(it) }
         body.addView(text("Дополнительно: доступ к уведомлениям включает музыку и уведомления на ГУ. Он настраивается во вкладке «Настройки» и не блокирует подключение карт.", 14f))
@@ -100,7 +109,7 @@ internal class ConnectionWizardView(
             })
         }
         progress.visibility = if (state.busy) View.VISIBLE else View.GONE
-        instruction.text = state.message
+        instruction.text = listOf(state.message, state.preparationNote).filter { it.isNotBlank() }.joinToString("\n\n")
         currentAction = state.action
         primary.text = when (state.action) {
             ConnectionWizard.Action.DEVICE_SETTINGS -> "Открыть сведения о телефоне"
@@ -119,6 +128,6 @@ internal class ConnectionWizardView(
         pairButton.isEnabled = !state.busy
         notificationAccess.visibility = if (PairingPrompt.available(context)) View.GONE else View.VISIBLE
         ports.text = if (state.pairPort > 0) "Порт сопряжения найден автоматически: ${state.pairPort}" else "Ищу порт этого телефона. Откройте в Android окно с кодом сопряжения."
-        stopButton.isEnabled = !state.busy
+        stopButton.isEnabled = true
     }
 }

@@ -29,6 +29,8 @@ class ScrcpyAudioSource(private val context: Context, private val listener: List
     @Volatile private var remotePath: String? = null
     @Volatile var lastAudibleMs = SystemClock.elapsedRealtime()
         private set
+    @Volatile var captureReady = false
+        private set
     private val startupTimeout = Runnable { fail("Захват USB-звука не запустился за 20 секунд") }
     private val health = object : Runnable {
         override fun run() {
@@ -76,6 +78,7 @@ class ScrcpyAudioSource(private val context: Context, private val listener: List
                 if (codec != 0x00726177) throw IOException("Ожидался PCM 16-bit LE")
                 checkOpen()
                 if (!listener.onFormatReady()) throw IOException("ГУ не готово принимать аудио")
+                captureReady = true
                 main.removeCallbacks(startupTimeout)
                 lastPacketMs = SystemClock.elapsedRealtime()
                 main.post(health)

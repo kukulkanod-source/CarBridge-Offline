@@ -1,5 +1,6 @@
 package com.example.carbridge
 
+import android.animation.ValueAnimator
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -41,6 +42,7 @@ class HuMediaOverlay(
     private val onDismissPanel: () -> Unit,
     private val onOpenMediaSource: (String) -> Unit = {},
     private val onLayoutChanged: (Boolean, Boolean) -> Unit = { _, _ -> },
+    private val onNavigationPlacementChanged: (Boolean, Int, Int) -> Unit = { _, _, _ -> },
 ) {
     private val context = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
@@ -51,7 +53,7 @@ class HuMediaOverlay(
     private var windowContext: Context? = null
     private var root: FrameLayout? = null
     private var windowParams: WindowManager.LayoutParams? = null
-    private var handle: TextView? = null
+    private var handle: View? = null
     private var handleParams: WindowManager.LayoutParams? = null
     private var displayId = -1
     private var controller: MediaController? = null
@@ -75,6 +77,13 @@ class HuMediaOverlay(
     private var artworkRequestGeneration = 0
     private var receiverRegistered = false
     private var designDensity = 200 / 160f
+    private var navigationDensity = 1f
+    private var normalHeight = 0
+    private var normalControlSize = 0
+    private var contentLayout: LinearLayout? = null
+    private var navigationVisible = false
+    private var stackedForNavigation = false
+    private var sizeAnimator: ValueAnimator? = null
 
     private val callback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: MediaMetadata?) = renderCurrentSession()
@@ -110,9 +119,11 @@ class HuMediaOverlay(
             val outputScale = if (outputWidth > 0) logicalWidth.toFloat() / outputWidth else 1f
             val density = interfaceDpi.coerceIn(80, 320) / 160f * outputScale
             designDensity = density
-            val dockWidth = (metrics.widthPixels * (if (resizeForMusic) 0.30f else DRAWER_FRACTION)).roundToInt().coerceIn(1, metrics.widthPixels)
+            val dockWidth = HuDockDimensions.musicWidth(metrics.widthPixels, resizeForMusic)
             val navigationDensity = density.coerceAtMost(metrics.widthPixels / 700f)
+            this.navigationDensity = navigationDensity
             val dockHeight = (metrics.heightPixels - (if (reserveDock) (HuDockDimensions.HEIGHT_DP * navigationDensity).roundToInt() else 0)).coerceAtLeast(1)
+            normalHeight = dockHeight
             val pad = (14 * density).roundToInt()
             val panel = FrameLayout(window).apply {
                 background = roundedBackground(Color.rgb(23, 30, 38), HuWindowCorners.radiusPx(navigationDensity))
@@ -140,6 +151,7 @@ class HuMediaOverlay(
                 orientation = LinearLayout.VERTICAL
                 setPadding(pad, pad, pad, (30 * density).roundToInt())
             }
+            contentLayout = content
             panel.addView(content, FrameLayout.LayoutParams(match, match))
 
             val header = LinearLayout(window).apply {
@@ -185,6 +197,7 @@ class HuMediaOverlay(
             }
             val controlSize = (dockWidth / 4f).roundToInt().coerceIn(
                 (44 * density).roundToInt(), (70 * density).roundToInt())
+            normalControlSize = controlSize
             val prev = button(window, "|◀", 20f, Color.WHITE) { transport { it.skipToPrevious() } }
             val play = button(window, "▶", 24f, Color.WHITE) {
                 val active = controller
@@ -223,17 +236,14 @@ class HuMediaOverlay(
             root = panel
             windowParams = layout
             displayId = id
-            val handleWidth = (20 * density).roundToInt().coerceAtLeast(12)
-            val handleHeight = (76 * density).roundToInt().coerceAtLeast(48)
-            val edgeHandle = TextView(window).apply {
-                text = "♫"
-                gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, 17f * density)
-                setTextColor(Color.WHITE)
+            val handleWidth = (8 * density).roundToInt().coerceAtLeast(1)
+            val handleHeight = (52 * density).roundToInt().coerceAtLeast(1)
+            val edgeHandle = View(window).apply {
                 contentDescription = "Открыть музыкальную панель; проведите пальцем от края экрана"
-                background = roundedBackground(Color.argb(224, 25, 32, 40), (12 * density).roundToInt())
+                background = roundedBackground(Color.argb(210, 65, 210, 125), (4 * density).roundToInt())
                 elevation = 12 * density
-                setOnTouchListener { _, event ->
+                setOnClickListener { toggleVisibility() }
+                setOnTouchListener { v, event ->
                     when (event.actionMasked) {
                         MotionEvent.ACTION_DOWN -> {
                             handleDownX = event.rawX
@@ -246,7 +256,7 @@ class HuMediaOverlay(
                                 val swipedIntoScreen = if (onRight) delta < 0 else delta > 0
                                 setVisible(swipedIntoScreen)
                             } else {
-                                toggleVisibility()
+                                v.performClick()
                             }
                             true
                         }
@@ -279,6 +289,7 @@ class HuMediaOverlay(
             cachedArtwork = HuMediaStateStore.readArtwork(context, cachedState)
             cachedArtwork?.let(art::setImageBitmap)
             lastArtwork = cachedArtwork
+            applyNavigationLayout(animate = false)
             applyVisibility(visible = false, animate = false)
             registerSessionReceiver()
             main.post(poll)
@@ -296,10 +307,88 @@ class HuMediaOverlay(
 
     fun isOnRight(): Boolean = onRight
 
+    fun setNavigationVisible(visible: Boolean) {
+        val changed = navigationVisible != visible
+        navigationVisible = visible
+        applyNavigationLayout(animate = changed)
+    }
+
+    private fun applyNavigationLayout(animate: Boolean) {
+        val panel = root ?: return
+        val params = windowParams ?: return
+        val wm = manager ?: return
+        val metrics = windowContext?.resources?.displayMetrics ?: return
+        val geometry = HuTopCardLayout(metrics.widthPixels,navigationDensity)
+        val compact = navigationVisible && isVisible
+        val roomForTwo = ((normalHeight - geometry.inset * 2 - geometry.gap) / 2).coerceAtLeast(1)
+        val cardHeight = minOf(geometry.navigationHeight,
+            if(compact) roomForTwo else (normalHeight - geometry.inset * 2).coerceAtLeast(1))
+        val targetHeight = if(compact) cardHeight else normalHeight
+        val targetY = if(compact) geometry.inset + cardHeight + geometry.gap else 0
+        if(stackedForNavigation!=compact) {
+            stackedForNavigation=compact
+            SessionDiagnostics.event("HU music navigation layout; compact=$compact; cardHeight=$cardHeight; right=$onRight")
+        }
+        params.gravity = Gravity.TOP or if(onRight) Gravity.END else Gravity.START
+        params.x = if(compact) geometry.inset else 0
+        onNavigationPlacementChanged(onRight,cardHeight,geometry.inset)
+        styleContent(compact,targetHeight)
+        sizeAnimator?.cancel(); sizeAnimator=null
+        if(animate && isVisible && panel.visibility==View.VISIBLE && ValueAnimator.areAnimatorsEnabled() &&
+            (params.height!=targetHeight || params.y!=targetY)) {
+            val fromHeight=params.height
+            val fromY=params.y
+            sizeAnimator=ValueAnimator.ofFloat(0f,1f).apply {
+                duration=240L
+                addUpdateListener { animation ->
+                    if(root!==panel) return@addUpdateListener
+                    val t=animation.animatedValue as Float
+                    params.height=(fromHeight+(targetHeight-fromHeight)*t).roundToInt()
+                    params.y=(fromY+(targetY-fromY)*t).roundToInt()
+                    runCatching { wm.updateViewLayout(panel,params) }
+                }
+                start()
+            }
+        } else {
+            params.height=targetHeight; params.y=targetY
+            runCatching { wm.updateViewLayout(panel,params) }
+        }
+    }
+
+    private fun styleContent(compact: Boolean, panelHeight: Int) {
+        val content=contentLayout ?: return
+        val header=content.getChildAt(0) as? LinearLayout ?: return
+        val controls=content.getChildAt(2) as? LinearLayout ?: return
+        val d=if(compact) navigationDensity else designDensity
+        val pad=((if(compact) 8 else 14)*d).roundToInt()
+        content.setPadding(pad,pad,pad,((if(compact) 8 else 30)*d).roundToInt())
+        val headerSize=if(compact) minOf((32*d).roundToInt(),panelHeight/5).coerceAtLeast(1) else buttonSize(d)
+        header.layoutParams=(header.layoutParams as LinearLayout.LayoutParams).apply { height=headerSize }
+        for(i in 1 until header.childCount) header.getChildAt(i).let { child ->
+            child.layoutParams=(child.layoutParams as LinearLayout.LayoutParams).apply { width=headerSize; height=headerSize }
+            (child as? TextView)?.setTextSize(TypedValue.COMPLEX_UNIT_PX,(if(compact) 20f else if(i==1) 21f else 24f)*d)
+        }
+        (header.getChildAt(0) as? TextView)?.setTextSize(TypedValue.COMPLEX_UNIT_PX,(if(compact) 11f else 13f)*d)
+        val controlSize=if(compact) minOf((48*d).roundToInt(),panelHeight/4,
+            ((windowParams?.width ?: 1)-pad*2)/3).coerceAtLeast(1) else normalControlSize
+        controls.layoutParams=(controls.layoutParams as LinearLayout.LayoutParams).apply {
+            height=controlSize; topMargin=((if(compact) 4 else 10)*d).roundToInt()
+        }
+        for(i in 0 until controls.childCount) controls.getChildAt(i).let { child ->
+            child.layoutParams=(child.layoutParams as LinearLayout.LayoutParams).apply { width=controlSize; height=controlSize }
+            (child as? TextView)?.setTextSize(TypedValue.COMPLEX_UNIT_PX,(if(i==1) 24f else 20f)*d)
+        }
+        title?.setTextSize(TypedValue.COMPLEX_UNIT_PX,(if(compact) 14f else 16f)*d)
+        artist?.setTextSize(TypedValue.COMPLEX_UNIT_PX,(if(compact) 11f else 13f)*d)
+        source?.visibility=if(compact) View.GONE else View.VISIBLE
+    }
+
     fun toggleVisibility(): Boolean {
         if (root == null) return isVisible
         isVisible = !isVisible
+        if(isVisible) applyNavigationLayout(animate = false)
         applyVisibility(isVisible, animate = true)
+        if(!isVisible && root?.visibility!=View.VISIBLE) applyNavigationLayout(animate = false)
         onLayoutChanged(isVisible, onRight)
         return isVisible
     }
@@ -307,7 +396,9 @@ class HuMediaOverlay(
     fun setVisible(visible: Boolean) {
         if (root == null) return
         isVisible = visible
+        if(visible) applyNavigationLayout(animate = false)
         applyVisibility(visible, animate = true)
+        if(!visible && root?.visibility!=View.VISIBLE) applyNavigationLayout(animate = false)
         onLayoutChanged(isVisible, onRight)
     }
 
@@ -329,18 +420,21 @@ class HuMediaOverlay(
             }
         } else if (animate && panel.visibility == View.VISIBLE) {
             panel.animate().translationX(hiddenX).setDuration(170L).withEndAction {
-                if (!isVisible) panel.visibility = View.GONE
+                if (!isVisible) {
+                    panel.visibility = View.GONE
+                    applyNavigationLayout(animate = false)
+                }
             }.start()
         } else {
             panel.translationX = hiddenX
             panel.visibility = View.GONE
         }
-        handle?.text = if (visible) "‹" else "♫"
         handle?.contentDescription = if (visible) "Скрыть музыкальную панель"
             else "Открыть музыкальную панель; проведите пальцем от края экрана"
     }
 
     fun close() {
+        sizeAnimator?.cancel(); sizeAnimator=null
         persistCurrent(flush = true)
         main.removeCallbacks(poll)
         if (receiverRegistered) runCatching { context.unregisterReceiver(sessionChangedReceiver) }
@@ -358,6 +452,9 @@ class HuMediaOverlay(
         handleParams = null
         displayId = -1
         isVisible = false
+        navigationVisible = false
+        stackedForNavigation = false
+        normalHeight = 0; normalControlSize = 0; contentLayout = null
         artwork = null
         title = null
         artist = null
@@ -380,6 +477,7 @@ class HuMediaOverlay(
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(KEY_ON_RIGHT, onRight).apply()
         val layout = windowParams ?: return
+        sizeAnimator?.cancel(); sizeAnimator=null
         layout.gravity = Gravity.TOP or if (onRight) Gravity.END else Gravity.START
         manager?.let { wm ->
             root?.let { panel ->
@@ -393,6 +491,7 @@ class HuMediaOverlay(
                 runCatching { wm.updateViewLayout(edge, edgeLayout) }
             }
         }
+        applyNavigationLayout(animate = false)
         onLayoutChanged(isVisible, onRight)
     }
 
@@ -690,7 +789,6 @@ class HuMediaOverlay(
     private companion object {
         const val PREFS = "carbridge_hu_layout"
         const val KEY_ON_RIGHT = "media_on_right"
-        const val DRAWER_FRACTION = 0.34f
         const val BASE_PANEL_FLAGS = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
         const val POLL_INTERVAL_MS = 5000L

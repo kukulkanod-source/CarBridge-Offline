@@ -10,6 +10,7 @@ object BridgeSettings {
     const val DISPLAY_MODE_1600_900 = "1600x900"
     const val DISPLAY_MODE_1920_1080 = "1920x1080"
     const val DISPLAY_MODE_1920_960 = "1920x960"
+    const val DISPLAY_MODE_1920_720 = "1920x720"
     const val DEFAULT_DISPLAY_DPI = 200
     const val DEFAULT_APP_CONTENT_DPI = 200
     val DISPLAY_DPI_OPTIONS: List<Int> = listOf(80, 100, 120, 140, 160, 180, 200, 240, 280, 320)
@@ -36,6 +37,7 @@ object BridgeSettings {
         val resizeForMusic: Boolean = true,
         val carLifeNavigation: Boolean = false,
         val carLifeArtwork: Boolean = false,
+        val restartAliceSession: Boolean = false,
     )
 
     private const val PREFS = "carbridge_adb_settings"
@@ -107,6 +109,7 @@ object BridgeSettings {
             resizeForMusic = prefs.getBoolean("resize_for_music", true),
             carLifeNavigation = prefs.getBoolean("carlife_navigation", false),
             carLifeArtwork = prefs.getBoolean("carlife_artwork", false),
+            restartAliceSession = prefs.getBoolean("restart_alice_session", false),
         )
     }
 
@@ -131,6 +134,7 @@ object BridgeSettings {
             .putBoolean("resize_for_music", config.resizeForMusic)
             .putBoolean("carlife_navigation", config.carLifeNavigation)
             .putBoolean("carlife_artwork", config.carLifeArtwork)
+            .putBoolean("restart_alice_session", config.restartAliceSession)
             .putBoolean("experimental_logical_display", config.logicalDisplayMode == DISPLAY_MODE_1600_900)
             .apply()
     }
@@ -146,6 +150,7 @@ object BridgeSettings {
         DISPLAY_MODE_1600_900 -> DISPLAY_MODE_1600_900
         DISPLAY_MODE_1920_1080 -> DISPLAY_MODE_1920_1080
         DISPLAY_MODE_1920_960 -> DISPLAY_MODE_1920_960
+        DISPLAY_MODE_1920_720 -> DISPLAY_MODE_1920_720
         else -> DISPLAY_MODE_HU
     }
 
@@ -206,6 +211,7 @@ object BridgeSettings {
     fun contentDpiForMode(mode: String): Int = when (normalizeLogicalDisplayMode(mode)) {
         DISPLAY_MODE_1920_1080, DISPLAY_MODE_1920_960 -> 300
         DISPLAY_MODE_1600_900 -> 250
+        DISPLAY_MODE_1920_720 -> 300
         else -> 200
     }
 

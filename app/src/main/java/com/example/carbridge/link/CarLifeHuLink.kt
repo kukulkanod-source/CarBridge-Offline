@@ -50,6 +50,7 @@ class CarLifeHuLink internal constructor(
     private val packets = CarLifePacketQueue()
     private val writerRunning = AtomicBoolean(false)
     private val videoLock = Any()
+    private val touchStream = CarLifeTouchStream()
     private val audioLock = Any()
     @Volatile private var mediaAudioStarted = false
     private var mediaPcmBytes = 0L
@@ -134,7 +135,7 @@ class CarLifeHuLink internal constructor(
         runCatching { input.close() }
         runCatching { output.close() }
         runCatching { closeTransport() }
-        SessionDiagnostics.event("HU input summary; messages=$touchRx; twoPointerPayloads=$twoPointerRx; types=${touchTypes.entries.joinToString { "0x${it.key.toString(16)}:${it.value}" }}")
+        SessionDiagnostics.event("HU input summary; messages=$touchRx; twoPointerPayloads=$twoPointerRx; zeroSecondaryPackets=$originPaddingRx; repeatedDowns=${touchStream.repeatedDowns}; types=${touchTypes.entries.joinToString { "0x${it.key.toString(16)}:${it.value}" }}")
         Log.i(TAG, "closed")
     }
 
@@ -300,8 +301,7 @@ class CarLifeHuLink internal constructor(
         }
         var p = H264.normalize(data)
         if (keyFrame) {
-            val c = csd
-            if (c != null && !H264.startsWithSps(p)) p = c + p
+            p = H264.withParameterSets(p, csd)
             needKey = false
             keyframeRequested.set(false)
         }
@@ -631,7 +631,7 @@ class CarLifeHuLink internal constructor(
     }
 
     private fun startVideo() = synchronized(videoLock) {
-        if (closed.get() || (started && !paused)) return@synchronized
+        if (closed.get()) return@synchronized
         val fallback = !videoInited
         if (fallback) {
             // Как headswap с фиксированным режимом, если ГУ прислал START без INIT.
@@ -654,6 +654,7 @@ class CarLifeHuLink internal constructor(
 
     private var touchRx = 0
     private var twoPointerRx = 0
+    private var originPaddingRx = 0
     private val touchTypes = java.util.concurrent.ConcurrentHashMap<Int,Int>()
 
     private fun onTouchMsg(type: Int, body: ByteArray) {
@@ -679,7 +680,12 @@ class CarLifeHuLink internal constructor(
             }
             return
         }
-        if(event.pointerX != null && event.pointerY != null) {
+        val originPadding=event.pointerX==0 && event.pointerY==0 && event.action !in setOf(5,6)
+        if(originPadding) {
+            originPaddingRx++
+            if(originPaddingRx==1) SessionDiagnostics.event("HU input: zero-filled secondary coordinates observed; ordinary MOVE cannot start a second pointer at origin")
+        }
+        if(event.pointerX != null && event.pointerY != null && !originPadding) {
             twoPointerRx++
             if(twoPointerRx <= 3) SessionDiagnostics.event("HU two-pointer payload #$twoPointerRx; action=${event.action}; bytes=${hex(body,48)}")
         }
@@ -690,7 +696,12 @@ class CarLifeHuLink internal constructor(
             SessionDiagnostics.event("HU touch #$touchRx action=${event.action} index=${event.actionIndex} " +
                 "p0=${event.x},${event.y} p1=$second")
         }
-        listener.onTouch(event)
+        val accepted = touchStream.accept(event)
+        if (event.action == 0 && touchStream.repeatedDowns > 0 &&
+            (touchStream.repeatedDowns <= 3 || touchStream.repeatedDowns % 100 == 0L)) {
+            SessionDiagnostics.event("CarLife repeated DOWN normalized; count=${touchStream.repeatedDowns}; forwarded=${accepted?.action ?: "none"}")
+        }
+        if (accepted != null) listener.onTouch(accepted)
     }
 
     // ------------------------------------------------------------------ utils

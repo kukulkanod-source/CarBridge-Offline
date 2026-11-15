@@ -79,11 +79,23 @@ class HuMediaOverlay(
     private var designDensity = 200 / 160f
     private var navigationDensity = 1f
     private var normalHeight = 0
+    private var resizeLayout = true
     private var normalControlSize = 0
     private var contentLayout: LinearLayout? = null
     private var navigationVisible = false
     private var stackedForNavigation = false
     private var sizeAnimator: ValueAnimator? = null
+    private var sidebarSlot: Pair<Int,Int>?=null
+    internal fun sidebarGeometry(): HuSidebarGeometry? {
+        val metrics=windowContext?.resources?.displayMetrics ?: return null
+        val g=HuTopCardLayout(metrics.widthPixels,navigationDensity,resizeLayout)
+        return HuSidebarGeometry(metrics.widthPixels,g.navigationWidth,normalHeight,g.inset,g.gap,navigationDensity,onRight)
+    }
+    internal fun setSidebarSlot(height: Int, top: Int) {
+        sidebarSlot=height to top
+        applyNavigationLayout(animate=false)
+    }
+    fun moveToOtherSide() { toggleSide() }
 
     private val callback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: MediaMetadata?) = renderCurrentSession()
@@ -108,6 +120,7 @@ class HuMediaOverlay(
         if (id <= 0 || !Settings.canDrawOverlays(context)) return false
         if (displayId == id && root != null) return true
         close()
+        resizeLayout=resizeForMusic
         val display = context.getSystemService(DisplayManager::class.java).getDisplay(id)
             ?.takeIf { it.isValid } ?: return false
         return try {
@@ -126,6 +139,7 @@ class HuMediaOverlay(
             normalHeight = dockHeight
             val pad = (14 * density).roundToInt()
             val panel = FrameLayout(window).apply {
+                setOnClickListener { (controller?.packageName ?: cachedState.packageName)?.let(onOpenMediaSource) }
                 background = roundedBackground(Color.rgb(23, 30, 38), HuWindowCorners.radiusPx(navigationDensity))
                 clipToOutline = true
                 elevation = 10 * density
@@ -318,20 +332,22 @@ class HuMediaOverlay(
         val params = windowParams ?: return
         val wm = manager ?: return
         val metrics = windowContext?.resources?.displayMetrics ?: return
-        val geometry = HuTopCardLayout(metrics.widthPixels,navigationDensity)
-        val compact = navigationVisible && isVisible
+        val geometry = HuTopCardLayout(metrics.widthPixels,navigationDensity,resizeLayout)
+        val slot=sidebarSlot
+        val compact = if(slot!=null) slot.first < normalHeight-geometry.inset*2 else navigationVisible && isVisible
         val roomForTwo = ((normalHeight - geometry.inset * 2 - geometry.gap) / 2).coerceAtLeast(1)
-        val cardHeight = minOf(geometry.navigationHeight,
-            if(compact) roomForTwo else (normalHeight - geometry.inset * 2).coerceAtLeast(1))
-        val targetHeight = if(compact) cardHeight else normalHeight
-        val targetY = if(compact) geometry.inset + cardHeight + geometry.gap else 0
+        val cardHeight = if(compact) roomForTwo else (normalHeight - geometry.inset * 2).coerceAtLeast(1)
+        val targetHeight = slot?.first ?: if(compact) (normalHeight-geometry.inset*2-geometry.gap-cardHeight).coerceAtLeast(1) else normalHeight
+        val targetY = slot?.second ?: if(compact) geometry.inset + cardHeight + geometry.gap else 0
         if(stackedForNavigation!=compact) {
             stackedForNavigation=compact
             SessionDiagnostics.event("HU music navigation layout; compact=$compact; cardHeight=$cardHeight; right=$onRight")
         }
         params.gravity = Gravity.TOP or if(onRight) Gravity.END else Gravity.START
-        params.x = if(compact) geometry.inset else 0
-        onNavigationPlacementChanged(onRight,cardHeight,geometry.inset)
+        // Both cards fit inside the exact reserved sidebar, with a small inner margin.
+        params.width=if(compact || slot!=null) (geometry.navigationWidth-geometry.inset*2).coerceAtLeast(1) else geometry.navigationWidth
+        params.x = if(compact || slot!=null) geometry.inset else 0
+        if(slot==null) onNavigationPlacementChanged(onRight,cardHeight,geometry.inset)
         styleContent(compact,targetHeight)
         sizeAnimator?.cancel(); sizeAnimator=null
         if(animate && isVisible && panel.visibility==View.VISIBLE && ValueAnimator.areAnimatorsEnabled() &&
@@ -387,17 +403,17 @@ class HuMediaOverlay(
         if (root == null) return isVisible
         isVisible = !isVisible
         if(isVisible) applyNavigationLayout(animate = false)
-        applyVisibility(isVisible, animate = true)
+        applyVisibility(isVisible, animate = isVisible || sidebarSlot==null)
         if(!isVisible && root?.visibility!=View.VISIBLE) applyNavigationLayout(animate = false)
         onLayoutChanged(isVisible, onRight)
         return isVisible
     }
 
-    fun setVisible(visible: Boolean) {
+    fun setVisible(visible: Boolean, animate: Boolean=true) {
         if (root == null) return
         isVisible = visible
         if(visible) applyNavigationLayout(animate = false)
-        applyVisibility(visible, animate = true)
+        applyVisibility(visible, animate = animate && (visible || sidebarSlot==null))
         if(!visible && root?.visibility!=View.VISIBLE) applyNavigationLayout(animate = false)
         onLayoutChanged(isVisible, onRight)
     }
@@ -455,6 +471,7 @@ class HuMediaOverlay(
         navigationVisible = false
         stackedForNavigation = false
         normalHeight = 0; normalControlSize = 0; contentLayout = null
+        sidebarSlot=null
         artwork = null
         title = null
         artist = null

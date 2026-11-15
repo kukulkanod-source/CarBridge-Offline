@@ -40,6 +40,40 @@ object H264 {
 
     fun startsWithSps(d: ByteArray) = nalTypes(d).firstOrNull() == 7
 
+    /** Repeat only missing parameter sets before the first video slice. Preserve AUD and in-band
+     * SPS/PPS. Inspired by HSD v0.8.1 withAvcParameterSets (GPL-3.0); no changes to the encoder.
+     */
+    fun withParameterSets(data: ByteArray, config: ByteArray?): ByteArray {
+        if (config == null) return data
+        data class Nal(val start: Int, val end: Int, val type: Int)
+        fun units(bytes: ByteArray): List<Nal> {
+            val codes = startCodes(bytes)
+            return codes.mapIndexedNotNull { index, code ->
+                val header = code[0] + code[1]
+                val end = codes.getOrNull(index + 1)?.get(0) ?: bytes.size
+                if (header >= end) null else Nal(code[0], end, bytes[header].toInt() and 31)
+            }
+        }
+        val nals = units(data)
+        val slice = nals.indexOfFirst { it.type in 1..5 }
+        if (slice < 0) return data
+        val prefix = nals.take(slice)
+        val hasSps = prefix.any { it.type == 7 }
+        val hasPps = prefix.any { it.type == 8 }
+        if (hasSps && hasPps) return data
+        val parameters = units(config)
+        fun parameter(type: Int) = parameters.lastOrNull { it.type == type }
+            ?.let { config.copyOfRange(it.start, it.end) }
+        val sps = if (hasSps) ByteArray(0) else parameter(7) ?: return data
+        val pps = if (hasPps) ByteArray(0) else parameter(8) ?: return data
+        val offset = when {
+            !hasSps && hasPps -> prefix.first { it.type == 8 }.start
+            hasSps -> prefix.last { it.type == 7 }.end
+            else -> prefix.takeWhile { it.type == 9 }.lastOrNull()?.end ?: nals.first().start
+        }
+        return data.copyOfRange(0, offset) + sps + pps + data.copyOfRange(offset, data.size)
+    }
+
     fun levelFor(w: Int, h: Int): Int {
         val mbs = ((w + 15) / 16) * ((h + 15) / 16)
         return when {

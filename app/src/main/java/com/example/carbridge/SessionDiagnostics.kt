@@ -35,10 +35,6 @@ object SessionDiagnostics {
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "bridge-diagnostics") }
     private val sequence = AtomicLong()
     private var latestFile: File? = null // Diagnostics-worker thread only.
-    private val sensitive = Regex(
-        "pair(?:ing)?[ _-]*(?:code|key)|код(?:\\s+для)?\\s+сопряж|-----BEGIN|adbkey|private.?key|certificate|identity",
-        RegexOption.IGNORE_CASE
-    )
 
     @Volatile private var current: Session? = null
 
@@ -273,7 +269,7 @@ object SessionDiagnostics {
     }
 
     /** Flushes the current file, then opens Android's sharing chooser with a temporary read grant. */
-    fun shareLatest(context: Context) {
+    fun shareLatest(context: Context, extraText: String? = null) {
         val app = context.applicationContext
         worker.execute {
             try {
@@ -281,18 +277,19 @@ object SessionDiagnostics {
                 val file = latestFile?.takeIf { it.isFile && it.length() > 0 } ?: directory(app).listFiles { entry ->
                     entry.isFile && entry.name.startsWith("session-") && entry.extension == "log" && entry.length() > 0
                 }?.maxByOrNull { it.lastModified() }
-                if (file == null) {
+                if (file == null && extraText.isNullOrBlank()) {
                     main.post { Toast.makeText(app, "Журнала пока нет. Сначала подключитесь к ГУ.", Toast.LENGTH_LONG).show() }
                     return@execute
                 }
-                val uri = FileProvider.getUriForFile(app, "${app.packageName}.diagnostics", file)
+                val uri = file?.let { FileProvider.getUriForFile(app, "${app.packageName}.diagnostics", it) }
                 main.post {
                     try {
                         val send = Intent(Intent.ACTION_SEND).apply {
                             type = "text/plain"
-                            putExtra(Intent.EXTRA_STREAM, uri)
+                            if(uri!=null)putExtra(Intent.EXTRA_STREAM, uri)
+                            if(!extraText.isNullOrBlank())putExtra(Intent.EXTRA_TEXT,extraText)
                             putExtra(Intent.EXTRA_SUBJECT, "CarBridge: журнал сеанса")
-                            clipData = ClipData.newUri(app.contentResolver, "CarBridge diagnostics", uri)
+                            if(uri!=null)clipData = ClipData.newUri(app.contentResolver, "CarBridge diagnostics", uri)
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
                         val chooser = Intent.createChooser(send, "Сохранить или отправить журнал").apply {
@@ -312,7 +309,5 @@ object SessionDiagnostics {
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
 
-    private fun clean(message: String): String =
-        if (sensitive.containsMatchIn(message)) "[sensitive authentication detail omitted]"
-        else message.take(1500).replace('\r', ' ').replace('\n', ' ')
+    private fun clean(message: String): String = DiagnosticMessageFilter.clean(message)
 }

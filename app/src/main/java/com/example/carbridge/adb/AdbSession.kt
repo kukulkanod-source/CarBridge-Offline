@@ -259,6 +259,40 @@ object AdbSession {
 
     fun open(destination: String): AdbChannel = open(destination, CONNECT_TIMEOUT_MS)
 
+    /** A short power command must not share the video transport's write/close watchdog. */
+    fun openIsolatedLocal(context: Context, destination: String): AdbChannel {
+        requireWorker()
+        require(destination.isNotBlank() && '\u0000' !in destination)
+        val endpoint = connectedEndpoint?.takeIf { it.mode == AdbConnectionMode.LOCAL_TCP && isConnected() }
+            ?: throw IOException("Локальный ADB для пробуждения недоступен")
+        val keys = keys(context.applicationContext, 3000L)
+        val isolated = AdbConnection.Builder("127.0.0.1", endpoint.port)
+            .setApi(Build.VERSION.SDK_INT).setPrivateKey(keys.privateKey).setCertificate(keys.certificate)
+            .setDeviceName("CarBridge power").setConnectTimeoutMillis(3000).build()
+        try {
+            if (!isolated.connect(3000L, TimeUnit.MILLISECONDS, true)) throw IOException("Power ADB timeout")
+            AdbTransportPolicy.requireAuthenticatedMode(isolated, AdbConnectionMode.LOCAL_TCP)
+            val stream = isolated.open(destination, 2000L)
+            return object : AdbChannel {
+                private val closed = AtomicBoolean(false)
+                override val input = stream.openInputStream()
+                override val output = stream.openOutputStream()
+                override fun close() {
+                    if (!closed.compareAndSet(false, true)) return
+                    // This connection owns only the short-lived power process.
+                    isolated.abort()
+                    runCatching { isolated.close() }
+                }
+            }
+        } catch (error: Exception) {
+            isolated.abort()
+            runCatching { isolated.close() }
+            throw error
+        }
+    }
+
+    fun transportFailure(): String = connection?.lastConnectionFailure ?: "none"
+
     fun open(destination: String, timeoutMs: Long): AdbChannel {
         requireWorker()
         require(destination.isNotBlank() && '\u0000' !in destination) { "Некорректный сервис ADB" }

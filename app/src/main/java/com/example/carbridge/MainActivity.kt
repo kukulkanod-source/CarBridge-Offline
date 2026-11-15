@@ -64,6 +64,10 @@ class MainActivity : AppCompatActivity() {
     private val wizard by lazy { ConnectionWizard.get(applicationContext) }
     private lateinit var wizardView: ConnectionWizardView
     private lateinit var settingsView: ScrollView
+    private lateinit var protocolPicker: ConnectionPickerView
+    private lateinit var connectionFrame: android.widget.FrameLayout
+    private var pendingProtocol: String? = null
+    private var carLifeAttemptAt = 0L
     private lateinit var settingsTab: Button
     private lateinit var connectionTab: Button
     private var selectedTab = 0
@@ -72,12 +76,13 @@ class MainActivity : AppCompatActivity() {
     private val wizardPoll = object : Runnable {
         override fun run() {
             if (!resumed) return
+            returnAfterCarLifeAttempt()
             if (selectedTab == 0 && !wizard.current().busy && !wizard.awaitingHeadUnit) {
                 if (AppDisplayState.displayId > 0) {
                     if (!wizard.current().connected) wizard.connected()
-                } else {
+                } else if(!CaptureService.hasActiveSession) {
                     val signature = wizard.environmentSignature()
-                    if (signature != environment) { environment = signature; wizard.check() }
+                    if (signature != environment || wizard.current().connected) { environment = signature; wizard.check() }
                 }
                 maybeConnectFromWizard()
             }
@@ -103,6 +108,7 @@ class MainActivity : AppCompatActivity() {
                 showStatus(intent.getStringExtra(CaptureService.EXTRA_STATUS) ?: return)
             } else if (intent.action == CaptureService.ACTION_DISPLAY_READY) {
                 wizard.connected()
+                updateNavigationMotion()
                 showStatus("Отдельный дисплей ГУ готов. Можно пользоваться телефоном независимо.")
             }
             updateAdbStatus()
@@ -110,6 +116,14 @@ class MainActivity : AppCompatActivity() {
     }
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val navigationLocationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            val granted=HuNavigationMotion.permitted(this)
+            HuNavigationMotion.setEnabled(this,granted)
+            updateNavigationMotion()
+            showStatus(if(granted) "Дорога движется по скорости геолокации. Нужен работающий навигатор; без свежей скорости разметка неподвижна."
+                else "Для скорости нужна точная геолокация. Разметка останется неподвижной.")
+        }
     private val wirelessPermissions =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
             if (wifiStartAfterPermission) {
@@ -123,6 +137,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         title = "CarBridge Offline"
         selectedTab = savedInstanceState?.getInt("selected_tab", 0) ?: 0
+        pendingProtocol = savedInstanceState?.getString("pending_protocol")
+        carLifeAttemptAt = savedInstanceState?.getLong("carlife_attempt_at",0L) ?: 0L
+        wizard.phonePreparationOnly = pendingProtocol != "carlife"
+        if (savedInstanceState == null && intent.getBooleanExtra(ConnectionScreens.EXTRA_SETTINGS, false)) selectedTab = 1
+        connectButton = Button(this)
+        wifiConnectButton = Button(this)
         pendingAutoUsbConnect = intent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED
         waitingUsbPermission = savedInstanceState?.getBoolean("waiting_usb", false) ?: false
         pendingUsbAfterConnect = savedInstanceState?.getBoolean("pending_usb", false) ?: false
@@ -165,6 +185,20 @@ class MainActivity : AppCompatActivity() {
             "к телефону во время подключения. При остановке сессии экран включается автоматически.")
         logicalDisplayButton = button("") { chooseLogicalDisplayMode() }
         scaleButton = button("") { chooseControlsScale() }
+        button("Настроить виджет Яндекс Погоды") { startActivity(Intent(this,WeatherWidgetSetupActivity::class.java)) }
+        button("Движение дороги по скорости GPS") {
+            AlertDialog.Builder(this).setTitle("Движение дороги")
+                .setMessage("Сейчас: ${if(HuNavigationMotion.enabled(this)) "включено" else "выключено"}. CarBridge использует скорость из геолокации, которую уже получает навигатор. На стоянке и без свежей скорости разметка замирает. Нужна точная геолокация; отдельный постоянный запрос GPS не запускается.")
+                .setPositiveButton("Включить") { _,_ ->
+                    if(HuNavigationMotion.permitted(this)) {
+                        HuNavigationMotion.setEnabled(this,true); updateNavigationMotion()
+                        showStatus("Движение дороги включено. Откройте навигацию и начните маршрут.")
+                    } else navigationLocationPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION,Manifest.permission.ACCESS_COARSE_LOCATION))
+                }.setNeutralButton("Выключить") { _,_ ->
+                    HuNavigationMotion.setEnabled(this,false); updateNavigationMotion()
+                    showStatus("Движение дороги выключено")
+                }.setNegativeButton("Отмена",null).show()
+        }
         dockModeButton = button("") {
             val current = BridgeSettings.read(this)
             AlertDialog.Builder(this).setTitle("Область приложения и панель")
@@ -207,9 +241,24 @@ class MainActivity : AppCompatActivity() {
                     "USB-звук выключен. Используется обычный выход телефона или Bluetooth.")
             }
         })
+        button("Восстановить звук без переподключения видео") {
+            sendCommand(Intent(this,CaptureService::class.java).setAction(CaptureService.ACTION_RESTART_AUDIO))
+        }
         text("USB-звук: Android 12+, отдельный PCM-канал, только при воспроизведении. " +
             "Включение и выключение во время сессии не требует перезапуска дисплея. " +
             "Это первая проверка общего звука; отдельный канал навигационных подсказок ещё не подключён.")
+        layout.addView(CheckBox(this).apply {
+            text = "Новый сеанс Алисы — эксперимент"
+            isChecked = BridgeSettings.read(this@MainActivity).restartAliceSession
+            setOnCheckedChangeListener { _, checked ->
+                BridgeSettings.save(this@MainActivity, BridgeSettings.read(this@MainActivity).copy(restartAliceSession = checked))
+                showStatus(if (checked) "При следующем вызове голосовой кнопкой CarBridge попробует заново открыть Алису. " +
+                    "Если стало хуже, выключите этот пункт — вернётся обычный способ вызова." else
+                    "Возвращён обычный способ вызова ассистента. Применяется со следующего нажатия голосовой кнопки.")
+            }
+        })
+        text("Для проверки повторных запросов: при вызове заново открывает подтверждённое окно Алисы на ГУ. " +
+            "Предыдущий диалог при этом завершается. По умолчанию выключено; переподключение не требуется.")
         button("Проверить микрофон ГУ — 10 секунд") {
             sendCommand(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_MICROPHONE_PROBE))
         }
@@ -259,9 +308,6 @@ class MainActivity : AppCompatActivity() {
         text("Для кнопок «Назад», «Домой» и выбора приложений поверх карт на ГУ разрешите CarBridge отображение поверх других приложений.")
         text("Выберите USB CarLife для передачи звука по кабелю. " +
             "Если USB-звук выключен, используется выход телефона или Bluetooth.")
-        connectButton = button("Подключиться к ГУ по USB") { startConnection() }
-        wifiConnectButton = button("Подключиться: Bluetooth + Wi-Fi Direct") { startWifiConnection() }
-        text("Сопрягите телефон и ГУ по Bluetooth и включите Wi-Fi на телефоне. После запуска CarBridge включите беспроводной CarLife на ГУ. Пароль и интернет не нужны.")
         button("Запустить выбранное приложение на ГУ") {
             sendCommand(Intent(this, CaptureService::class.java)
                 .setAction(CaptureService.ACTION_LAUNCH_DISPLAY_APP)
@@ -282,6 +328,8 @@ class MainActivity : AppCompatActivity() {
                 .setPositiveButton("Закрыть", null).show()
         }
         status = TextView(this).apply {
+            maxLines=3
+            ellipsize=android.text.TextUtils.TruncateAt.END
             text = savedInstanceState?.getString("status") ?: "Мастер проверит готовность телефона и подскажет следующий шаг."
             val padding = (16 * resources.displayMetrics.density).toInt()
             setPadding(padding, padding / 2, padding, padding / 2)
@@ -297,25 +345,40 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
             },
             stop = {
-                wizard.cancelPreparation("Подготовка и запрос подключения остановлены.")
-                sendCommand(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_STOP))
-                wizard.connectionFailed("Соединение остановлено. Для нового подключения нажмите «Проверить и продолжить».")
+                stopConnection()
             })
+        protocolPicker = ConnectionPickerView(this, choose = ::chooseProtocol)
+        connectionFrame=android.widget.FrameLayout(this).apply { addView(wizardView); addView(protocolPicker) }
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        connectionTab = Button(this).apply { text = "Подключение"; setOnClickListener { selectTab(0) } }
+        connectionTab = Button(this).apply { text = "Подключение"; setOnClickListener {
+            if (!wizard.current().busy && !wizard.awaitingHeadUnit) {
+                pendingProtocol = null; wizard.phonePreparationOnly = true; wizard.cancelConnectionRequest()
+                wizard.resumePreparation()
+            }
+            selectTab(0)
+        } }
         settingsTab = Button(this).apply { text = "Настройки"; setOnClickListener { selectTab(1) } }
         tabs.addView(connectionTab, LinearLayout.LayoutParams(0, -2, 1f))
         tabs.addView(settingsTab, LinearLayout.LayoutParams(0, -2, 1f))
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            fitsSystemWindows=true
             addView(tabs)
             addView(status)
-            addView(wizardView, LinearLayout.LayoutParams(-1, 0, 1f))
+            addView(connectionFrame, LinearLayout.LayoutParams(-1, 0, 1f))
             addView(settingsView, LinearLayout.LayoutParams(-1, 0, 1f))
+            addView(LinearLayout(this@MainActivity).apply {
+                addView(Button(this@MainActivity).apply { text="Журнал"; setOnClickListener { SessionDiagnostics.shareLatest(this@MainActivity) } }, LinearLayout.LayoutParams(0,-2,1f))
+                addView(Button(this@MainActivity).apply { text="Стоп"; setOnClickListener {
+                    stopConnection()
+                } }, LinearLayout.LayoutParams(0,-2,1f))
+            })
         })
         selectTab(selectedTab)
         wizard.state.observe(this) { next ->
             wizardView.render(next)
+            renderConnectionPage()
+            if(AppDisplayState.displayId<=0 && !next.connected)showStatus(next.message)
             settingsTab.isEnabled = !next.busy
             if (resumed) maybeConnectFromWizard()
         }
@@ -337,10 +400,25 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if(intent.getBooleanExtra(ConnectionScreens.EXTRA_SETTINGS,false)) { selectTab(1); return }
+        if(intent.action==Intent.ACTION_MAIN) {
+            pendingProtocol=null;carLifeAttemptAt=0L
+            wizard.phonePreparationOnly=true;wizard.cancelConnectionRequest();wizard.resumePreparation()
+            selectTab(0);return
+        }
         if (intent.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
             pendingAutoUsbConnect = true
             if (resumed) runPendingAutoUsbConnect()
         }
+    }
+
+    @Deprecated("Uses the existing Activity back handler")
+    override fun onBackPressed() {
+        if(selectedTab==1) { selectTab(0); return }
+        if(pendingProtocol!=null && !wizard.current().busy && !wizard.awaitingHeadUnit) {
+            pendingProtocol=null; wizard.phonePreparationOnly=true; wizard.cancelConnectionRequest(); selectTab(0); return
+        }
+        super.onBackPressed()
     }
 
     private fun runPendingAutoUsbConnect() {
@@ -349,12 +427,18 @@ class MainActivity : AppCompatActivity() {
         val now = SystemClock.elapsedRealtime()
         if (lastAutoUsbConnectAt != 0L && now - lastAutoUsbConnectAt < 2_000L) return
         lastAutoUsbConnectAt = now
+        if(wizard.awaitingHeadUnit || CaptureService.hasActiveSession || AppDisplayState.displayId>0) { selectTab(0); return }
+        if(pendingProtocol=="carlife") {
+            // A choice made before plugging the cable remains explicit user authorization.
+            selectTab(0);wizard.check(autoConnect=true);return
+        }
+        pendingProtocol=null; wizard.phonePreparationOnly=true; wizard.cancelConnectionRequest()
         selectTab(0)
-        showStatus("Обнаружено подключение USB. Проверяю CarLife, офлайн ADB и выбранное приложение…")
+        showStatus("USB подключён. Проверяю телефон; затем выберите протокол подключения.")
         // Give UsbManager a moment to publish the accessory before the normal validation path.
         window.decorView.postDelayed({
             if (isFinishing || isDestroyed) return@postDelayed
-            if (resumed) startConnection() else pendingAutoUsbConnect = true
+            if (resumed) wizard.check() else pendingAutoUsbConnect = true
         }, 300L)
     }
 
@@ -362,7 +446,7 @@ class MainActivity : AppCompatActivity() {
         selectedTab = if (index == 1 && wizard.current().busy) 0 else index
         wizard.automaticDiscoveryChecks = selectedTab == 0
         if (!::wizardView.isInitialized) return
-        wizardView.visibility = if (selectedTab == 0) View.VISIBLE else View.GONE
+        renderConnectionPage()
         settingsView.visibility = if (selectedTab == 1) View.VISIBLE else View.GONE
         connectionTab.isSelected = selectedTab == 0
         settingsTab.isSelected = selectedTab == 1
@@ -372,13 +456,59 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun maybeConnectFromWizard() {
+        if(CaptureService.hasActiveSession)return
         if (!resumed || selectedTab != 0 || isFinishing || isDestroyed || wizard.awaitingHeadUnit || AdbSetupViewModel.isOperationBusy()) return
-        if (wizard.takeConnectionRequest()) startPreparedConnection()
+        if (pendingProtocol == "carlife" && wizard.takeConnectionRequest()) startPreparedConnection()
+    }
+
+    private fun renderConnectionPage() {
+        if(!::protocolPicker.isInitialized)return
+        connectionFrame.visibility=if(selectedTab==0)View.VISIBLE else View.GONE
+        val state=wizard.current()
+        val picker=selectedTab==0 && !state.busy && (state.connected || (state.phoneReady && pendingProtocol==null))
+        protocolPicker.visibility=if(picker)View.VISIBLE else View.GONE
+        wizardView.visibility=if(selectedTab==0 && !picker)View.VISIBLE else View.GONE
+        protocolPicker.setSessionActive(CaptureService.hasActiveSession || AppDisplayState.displayId>0)
+    }
+
+    private fun stopConnection() {
+        carLifeAttemptAt=0L
+        wizard.cancelPreparation("Подготовка и запрос подключения остановлены.")
+        sendCommand(Intent(this,CaptureService::class.java).setAction(CaptureService.ACTION_STOP))
+        pendingProtocol=null; wizard.phonePreparationOnly=true
+        wizard.connectionFailed("Остановлено. Для нового подключения нажмите «Проверить и продолжить».")
+    }
+
+    private fun returnAfterCarLifeAttempt() {
+        if(carLifeAttemptAt==0L || CaptureService.hasActiveSession || wizard.current().busy ||
+            SystemClock.elapsedRealtime()-carLifeAttemptAt in 0L..1500L)return
+        carLifeAttemptAt=0L
+        pendingProtocol=null;wizard.phonePreparationOnly=true;wizard.cancelConnectionRequest()
+        if(!wizard.preparationIsCancelled())wizard.check()
+        renderConnectionPage()
+    }
+
+    private fun chooseProtocol(protocol: String) {
+        if(CaptureService.hasActiveSession || AppDisplayState.displayId>0 || wizard.awaitingHeadUnit) {
+            showStatus("Сеанс уже работает. Для смены подключения нажмите «Стоп»."); return
+        }
+        if(!wizard.current().phoneReady || wizard.current().busy) { wizard.check(); return }
+        if(protocol=="carlife") { startConnection(); return }
+        val carbit=protocol=="carbit"
+        val body=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setPadding(24,12,24,12) }
+        body.addView(TextView(this).apply { text="Выберите способ подключения"; textSize=18f })
+        body.addView(Button(this).apply { text="USB · пока недоступно"; isEnabled=false })
+        body.addView(TextView(this).apply { text="USB для этого протокола ещё не реализован. Доступно беспроводное подключение."; setPadding(8,4,8,16) })
+        val dialog=AlertDialog.Builder(this).setTitle(if(carbit)"CarbitLink" else "Android Auto")
+            .setView(body).setNegativeButton("Назад",null).setNeutralButton("Настройки") { _,_->selectTab(1) }.create()
+        body.addView(Button(this).apply { text=if(carbit)"Беспроводное · Wi-Fi" else "Беспроводное · через адаптер"
+            setOnClickListener { dialog.dismiss(); startActivity(Intent(this@MainActivity,if(carbit)CarbitConnectActivity::class.java else AaWirelessConnectActivity::class.java)) } })
+        dialog.show()
     }
 
     private fun performWizardAction(action: ConnectionWizard.Action) {
         when (action) {
-            ConnectionWizard.Action.RETRY -> startConnection()
+            ConnectionWizard.Action.RETRY -> if(pendingProtocol=="carlife")startConnection() else { wizard.resumePreparation(); wizard.check() }
             ConnectionWizard.Action.DEVICE_SETTINGS -> openWizardSettings(Settings.ACTION_DEVICE_INFO_SETTINGS)
             ConnectionWizard.Action.DEBUG_SETTINGS -> openWizardSettings(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
             ConnectionWizard.Action.WIFI -> openWizardSettings(Settings.ACTION_WIFI_SETTINGS)
@@ -450,6 +580,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startConnection() {
+        pendingProtocol="carlife"; wizard.phonePreparationOnly=false
         selectTab(0)
         wizard.check(autoConnect = true)
     }
@@ -600,6 +731,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 try {
                     startForegroundService(Intent(this, CaptureService::class.java)
+                        .putExtra(CaptureService.EXTRA_NAVIGATION_MOTION,resumed && HuNavigationMotion.enabled(this) && HuNavigationMotion.permitted(this))
                         .putExtra(CaptureService.EXTRA_MODE, CaptureService.MODE_ADB)
                         .putExtra(CaptureService.EXTRA_TRANSPORT, CaptureService.TRANSPORT_WIFI)
                         .putExtra(CaptureService.EXTRA_STUB, false)
@@ -631,11 +763,13 @@ class MainActivity : AppCompatActivity() {
         try {
             wizard.waitingForHeadUnit()
             startForegroundService(Intent(this, CaptureService::class.java)
+                .putExtra(CaptureService.EXTRA_NAVIGATION_MOTION,resumed && HuNavigationMotion.enabled(this) && HuNavigationMotion.permitted(this))
                 .putExtra(CaptureService.EXTRA_MODE, CaptureService.MODE_ADB)
                 .putExtra(CaptureService.EXTRA_STUB, false)
                 .putExtra(CaptureService.EXTRA_PACKAGE, config.packageNameLaunch)
                 .putExtra(CaptureService.EXTRA_SCREEN_OFF, config.screenOff))
-            showStatus(if (offline) "USB: запускаю CarLife. После ответа ГУ проверю локальный ADB; после переключения USB ему может потребоваться несколько секунд."
+            carLifeAttemptAt=SystemClock.elapsedRealtime()
+            showStatus(if (offline) "USB: ожидаю CarLife от ГУ. В эмуляторе Windows нажмите «Подключить» или «Переподключить». После ответа проверю локальный ADB."
                 else "USB: запускаю CarLife и отдельный дисплей через ADB…")
         } catch (error: Exception) {
             wizard.connectionFailed("Не удалось запустить сессию. Повторите подключение.")
@@ -800,6 +934,7 @@ class MainActivity : AppCompatActivity() {
             BridgeSettings.DISPLAY_MODE_1600_900,
             BridgeSettings.DISPLAY_MODE_1920_1080,
             BridgeSettings.DISPLAY_MODE_1920_960,
+            BridgeSettings.DISPLAY_MODE_1920_720,
         )
         val labels = modes.map(::logicalDisplayModeLabel).toTypedArray()
         val selected = modes.indexOf(BridgeSettings.read(this).logicalDisplayMode).coerceAtLeast(0)
@@ -809,6 +944,7 @@ class MainActivity : AppCompatActivity() {
                 BridgeSettings.setLogicalDisplayMode(this, mode)
                 refreshDisplaySettings()
                 val statusMessage = when (mode) {
+                    BridgeSettings.DISPLAY_MODE_1920_720 -> "Выбран экран 1920×720 / 300 DPI. Для CarbitLink размер согласуется при подключении; для CarLife требуется видеорежим ГУ 8:3. Остановите сеанс и переподключитесь."
                     BridgeSettings.DISPLAY_MODE_1600_900 ->
                         "Выбран виртуальный экран 1600×900. Остановите сессию и переподключитесь."
                     BridgeSettings.DISPLAY_MODE_1920_1080 ->
@@ -823,6 +959,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun logicalDisplayModeLabel(mode: String): String = when (mode) {
+        BridgeSettings.DISPLAY_MODE_1920_720 -> "1920×720 / 300 dpi — широкий экран"
         BridgeSettings.DISPLAY_MODE_1600_900 -> "1600×900 / 250 dpi"
         BridgeSettings.DISPLAY_MODE_1920_1080 -> "1920×1080 / 300 dpi — рекомендуемый"
         BridgeSettings.DISPLAY_MODE_1920_960 -> "1920×960 / 300 dpi — для ГУ 1280×640 (2:1)"
@@ -924,6 +1061,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         resumed = true
+        updateNavigationMotion()
         if (::selectedApp.isInitialized) {
             refreshSelection()
             refreshDisplaySettings()
@@ -934,7 +1072,10 @@ class MainActivity : AppCompatActivity() {
             requestUsb()
         }
         runPendingAutoUsbConnect()
+        returnAfterCarLifeAttempt()
         if (::wizardView.isInitialized && selectedTab == 0) {
+            if(pendingProtocol==null && !CaptureService.hasActiveSession && !wizard.current().busy && !wizard.awaitingHeadUnit)
+                wizard.resumePreparation()
             environment = wizard.environmentSignature()
             wizard.check()
             maybeConnectFromWizard()
@@ -949,8 +1090,17 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
+    private fun updateNavigationMotion() {
+        // A location FGS is enabled only while this Activity is visible, never from a USB receiver.
+        if(!resumed || AppDisplayState.displayId<=0) return
+        sendCommand(Intent(this,CaptureService::class.java).setAction(CaptureService.ACTION_NAVIGATION_MOTION)
+            .putExtra(CaptureService.EXTRA_NAVIGATION_MOTION,HuNavigationMotion.enabled(this) && HuNavigationMotion.permitted(this)))
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt("selected_tab", selectedTab)
+        outState.putString("pending_protocol",pendingProtocol)
+        outState.putLong("carlife_attempt_at",carLifeAttemptAt)
         outState.putBoolean("waiting_usb", waitingUsbPermission)
         outState.putBoolean("pending_usb", pendingUsbAfterConnect)
         if (::status.isInitialized) outState.putString("status", status.text.toString())

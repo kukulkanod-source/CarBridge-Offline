@@ -22,6 +22,14 @@ internal class HuStatusIcon(private val kind: String, tint: Int = Color.WHITE) :
         canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
         canvas.scale(bounds.width() / 24f, bounds.height() / 24f)
         when (kind) {
+            "weather" -> {
+                paint.style=Paint.Style.FILL
+                paint.color=Color.rgb(255,190,55); canvas.drawCircle(8f,8f,5f,paint)
+                paint.color=Color.rgb(145,198,235)
+                canvas.drawCircle(11f,15f,5f,paint); canvas.drawCircle(17f,13f,5f,paint)
+                canvas.drawRoundRect(RectF(6f,14f,23f,20f),3f,3f,paint)
+                paint.color=Color.WHITE; paint.style=Paint.Style.STROKE
+            }
             "keyboard" -> {
                 canvas.drawRoundRect(RectF(1f, 5f, 23f, 20f), 2f, 2f, paint)
                 for (y in 0..1) for (x in 0..4) canvas.drawPoint(4f + x * 4, 9f + y * 4, paint)

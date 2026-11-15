@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.carbridge.adb"
         minSdk = 30
         targetSdk = 34
-        versionCode = 65
-        versionName = "0.64-navigation-road-perspective"
+        versionCode = 88
+        versionName = "0.87-carlife-touch-video-recovery"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -22,6 +22,8 @@ android {
 }
 
 dependencies {
+    implementation(project(":aare"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.6.4")
     implementation(project(":libadb"))
     implementation("org.conscrypt:conscrypt-android:2.5.3")
     implementation("org.bouncycastle:bcpkix-jdk15to18:1.81")

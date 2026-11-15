@@ -30,7 +30,7 @@ internal class ConnectionWizardView(
     private fun text(value: String, size: Float) = TextView(context).apply {
         text = value; textSize = size; setPadding(0, 10, 0, 14)
     }
-    private val heading = text("Подключение к ГУ", 25f)
+    private val heading = text("Подготовка телефона", 25f)
     private val progress = ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply { isIndeterminate = true }
     private val instruction = text("", 18f).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
     private val primary = Button(context)
@@ -92,7 +92,7 @@ internal class ConnectionWizardView(
     }
     fun render(state: ConnectionWizard.State) {
         rows.forEach { (step, view) ->
-            view.visibility = if (step in ConnectionWizard.PREPARATION_STEPS && step !in state.rows) View.GONE else View.VISIBLE
+            view.visibility = if ((step in ConnectionWizard.PREPARATION_STEPS || step == ConnectionWizard.Step.USB) && step !in state.rows) View.GONE else View.VISIBLE
             val mark = state.rows[step] ?: ConnectionWizard.Mark.WAITING
             val glyph = when (mark) {
                 ConnectionWizard.Mark.PASSED -> "●"

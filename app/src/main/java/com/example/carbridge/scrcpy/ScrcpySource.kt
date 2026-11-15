@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.util.DisplayMetrics
 import com.example.carbridge.SessionDiagnostics
+import com.example.carbridge.BridgeSettings
 import com.example.carbridge.VideoProfile
 import com.example.carbridge.adb.AdbChannel
 import com.example.carbridge.adb.AdbSession
@@ -45,7 +46,8 @@ class ScrcpySource(
     private val videoProfile: VideoProfile = VideoProfile.DEFAULT,
     private val maxVideoSize: Int? = null,
     private val touchSourceWidth: Int = width,
-    private val touchSourceHeight: Int = height
+    private val touchSourceHeight: Int = height,
+    private val isolatedPowerCommand: Boolean = false
 ) {
     interface Listener {
         fun onConfig(csd: ByteArray)
@@ -115,6 +117,26 @@ class ScrcpySource(
     private val pinchReserved = AtomicBoolean(false)
     private val pinchRevision = AtomicLong()
     private val launchRevision = AtomicLong()
+    private class RequestedLaunch(val pkg: String, val component: ComponentName, val display: Int,
+        val token: Long, val started: Long, val confirmed: AtomicBoolean = AtomicBoolean(false)) {
+        private val callbacks=mutableListOf<(Boolean,String)->Unit>()
+        private var result: Pair<Boolean,String>?=null
+        fun subscribe(callback: (Boolean,String)->Unit) {
+            val ready=synchronized(this) {
+                result.also { if(it==null) callbacks.add(callback) }
+            }
+            ready?.let { callback(it.first,it.second) }
+        }
+        fun complete(success: Boolean, details: String) {
+            val waiting=synchronized(this) {
+                if(result!=null) return
+                result=success to details
+                callbacks.toList().also { callbacks.clear() }
+            }
+            waiting.forEach { it(success,details) }
+        }
+    }
+    @Volatile private var requestedLaunch: RequestedLaunch? = null
     private val assistantDiagnosticRevision = AtomicLong()
     private val touchEpoch = AtomicLong()
     @Volatile private var activePinch: PinchRun? = null
@@ -239,7 +261,10 @@ class ScrcpySource(
                     val primaryId = huPrimaryPointerId ?: return@submit
                     // Some HUs send both coordinates in MOVE without a separate
                     // POINTER_DOWN. The payload itself confirms the second finger.
-                    if (huSecondaryPointerId == null && event.pointerX != null && event.pointerY != null) {
+                    // A number of receivers pad every one-finger packet with p1=(0,0).
+                    // Only an explicit POINTER_DOWN can establish a second finger at the origin.
+                    if (huSecondaryPointerId == null && event.pointerX != null && event.pointerY != null &&
+                        (event.pointerX != 0 || event.pointerY != 0)) {
                         huSecondaryPointerId = nextPointerId()
                         huSecondaryX = event.pointerX
                         huSecondaryY = event.pointerY
@@ -452,7 +477,6 @@ class ScrcpySource(
         launcherComponent: ComponentName?,
         onLaunchResult: (Boolean, String) -> Unit
     ) {
-        val launchToken = launchRevision.incrementAndGet()
         ScrcpyProtocol.startApp(packageName)
         val component = launcherComponent?.takeIf { it.packageName == packageName }
             ?: resolveLauncherComponent(packageName)
@@ -465,64 +489,137 @@ class ScrcpySource(
             onLaunchResult(false, "виртуальный дисплей ещё не готов")
             return
         }
+        val pending=requestedLaunch
+        if (pending != null && pending.pkg == packageName && pending.component == component &&
+            pending.display == targetDisplay && pending.token == launchRevision.get() &&
+            !pending.confirmed.get() && SystemClock.elapsedRealtime()-pending.started < 20000L) {
+            SessionDiagnostics.event("HU duplicate launch coalesced; package=$packageName; display=$targetDisplay")
+            pending.subscribe(onLaunchResult)
+            return
+        }
+        val launchToken = launchRevision.incrementAndGet()
+        val request=RequestedLaunch(packageName,component,targetDisplay,launchToken,SystemClock.elapsedRealtime())
+        request.subscribe(onLaunchResult)
+        requestedLaunch=request
         try {
             displayCommands.execute {
-                if (closed.get() || appDisplay() != targetDisplay) return@execute
+                if (closed.get() || appDisplay() != targetDisplay || launchRevision.get() != launchToken) return@execute
                 try {
                     configureLandscape(targetDisplay)
-                    val start = runShellCommand(
-                        "am start --user current --display $targetDisplay -n ${shellArgument(component.flattenToString())}"
-                    )
+                    val before=runShellCommand(HuWindowSnapshot.COMMAND)
+                    val reuseTask=component==resolveLauncherComponent(packageName)
+                    val alreadyOnHu=reuseTask && HuWindowSnapshot.foregroundPackage(before,targetDisplay)==packageName
+                    // Restore the existing task on this display instead of restarting a launcher alias.
+                    // Restrict reuse to a single-app root; never focus a mixed or system task.
+                    val task=if(alreadyOnHu || !reuseTask) null else ownedAppRoot(runShellCommand("am stack list"),packageName,targetDisplay)
+                    val focused=task?.let {
+                        if(launchRevision.get()!=launchToken || closed.get() || appDisplay()!=targetDisplay) return@execute
+                        val result=runShellCommand("am task focus ${it.taskId}")
+                        !shellCommandFailed(result) &&
+                            HuWindowSnapshot.foregroundPackage(runShellCommand(HuWindowSnapshot.COMMAND),targetDisplay)==packageName
+                    } == true
+                    if(launchRevision.get()!=launchToken || closed.get() || appDisplay()!=targetDisplay) return@execute
+                    val start = if(alreadyOnHu || focused) "existing task reused" else runShellCommand(
+                        "am start --user current --display $targetDisplay -n ${shellArgument(component.flattenToString())}")
                     if (shellCommandFailed(start)) throw IOException(start.take(240).ifBlank { "Android не запустил приложение" })
-                    onLaunchResult(true, "полноэкранный запуск ${component.flattenToShortString()}; " +
+                    if (launchRevision.get() != launchToken || closed.get()) return@execute
+                    SessionDiagnostics.event("HU app launch requested; package=$packageName; display=$targetDisplay; existingTask=${alreadyOnHu || focused}")
+                    request.complete(true, "полноэкранный запуск ${component.flattenToShortString()}; " +
                         "display=$targetDisplay; ${start.trim().take(180)}")
                     diagnoseDisplay("app launch ${component.packageName}", force = true)
-                    verifyLaunchPlacement(packageName, targetDisplay, launchToken)
+                    verifyLaunchPlacement(packageName, targetDisplay, launchToken, onResult={ opened ->
+                        request.confirmed.set(true)
+                        if (!opened) listener.onStatus("Окно $packageName не подтверждено на ГУ. Повторите запуск или отправьте журнал")
+                    })
                 } catch (error: Exception) {
-                    onLaunchResult(false, error.message ?: error.javaClass.simpleName)
+                    if(requestedLaunch===request) requestedLaunch=null
+                    if(launchRevision.get()==launchToken) request.complete(false, error.message ?: error.javaClass.simpleName)
                 }
             }
         } catch (error: RejectedExecutionException) {
-            onLaunchResult(false, "ADB-команда отменена при остановке сессии")
+            if(requestedLaunch===request) requestedLaunch=null
+            request.complete(false, "ADB-команда отменена при остановке сессии")
         }
     }
 
-    fun watchRequestedLaunch(pkg: String) {
+    fun watchRequestedLaunch(pkg: String, onResult: (Boolean,Long) -> Unit) {
         val target=appDisplay()?.takeIf { it>0 } ?: return
-        verifyLaunchPlacement(pkg,target,launchRevision.incrementAndGet())
+        val token=launchRevision.incrementAndGet()
+        verifyLaunchPlacement(pkg,target,token,notification=true,onResult={ onResult(it,token) })
     }
+    fun isCurrentLaunch(token: Long): Boolean = !closed.get() && launchRevision.get()==token
     fun cancelLaunchPlacement() { launchRevision.incrementAndGet() }
 
+    private data class OwnedAppRoot(val rootId: Int, val taskId: Int, val topComponent: ComponentName?)
+
+    private fun ownedAppRoot(roots: String, pkg: String, display: Int): OwnedAppRoot? {
+        val headers=Regex("(?m)^(?:RootTask|Stack) id=(\\d+)\\b[^\\r\\n]*").findAll(roots).toList()
+        for(index in headers.indices) {
+            val header=headers[index]
+            if(!Regex("displayId=$display\\b").containsMatchIn(header.value)) continue
+            val section=roots.substring(header.range.last+1,headers.getOrNull(index+1)?.range?.first ?: roots.length)
+            val tasks=Regex("(?m)^\\s*taskId=(\\d+): ([A-Za-z0-9_.]+)/").findAll(section).toList()
+            if(tasks.size != 1 || tasks.single().groupValues[2] != pkg ||
+                !section.contains("topActivity=ComponentInfo{$pkg/")) continue
+            val root=header.groupValues[1].toIntOrNull() ?: continue
+            val task=tasks.single().groupValues[1].toIntOrNull() ?: continue
+            val top=Regex("topActivity=ComponentInfo\\{([^\\s}]+)\\}").find(section)?.groupValues?.get(1)
+                ?.let(ComponentName::unflattenFromString)
+            return OwnedAppRoot(root,task,top)
+        }
+        return null
+    }
+
     /** Some launcher trampolines reuse a task on display 0. Only repair the app
-     * explicitly requested on the HU, for six seconds after launch. Never move
+     * explicitly requested on the HU, for a bounded startup window. Never move
      * mixed/system roots or continuously steal applications from the phone. */
-    private fun verifyLaunchPlacement(pkg: String, target: Int, token: Long, assistant: Boolean = false) {
-        listOf(500L, 1500L, 3000L, 6000L).forEach { delay ->
+    private fun verifyLaunchPlacement(pkg: String, target: Int, token: Long, assistant: Boolean = false,
+        notification: Boolean = false, onResult: ((Boolean) -> Unit)? = null) {
+        val reported=AtomicBoolean(false)
+        val voiceFocused=AtomicBoolean(false)
+        val delays=if(notification) listOf(500L,1500L,3000L)
+            else if(assistant) listOf(500L,1500L,3000L,6000L)
+            else listOf(500L,1500L,3000L,6000L,10000L,15000L,20000L)
+        fun report(opened: Boolean) {
+            if(launchRevision.get()!=token || closed.get() || appDisplay()!=target) return
+            if(reported.compareAndSet(false,true)) {
+                SessionDiagnostics.event("HU launch placement result; package=$pkg; display=$target; opened=$opened; notification=$notification")
+                onResult?.invoke(opened)
+            }
+        }
+        delays.forEach { delay ->
             controls.schedule({
                 if (closed.get() || launchRevision.get() != token || appDisplay() != target) return@schedule
                 try { displayCommands.execute {
                     if (closed.get() || launchRevision.get() != token || appDisplay() != target) return@execute
                     runCatching {
                         val snapshot = runShellCommand(HuWindowSnapshot.COMMAND)
-                        if (HuWindowSnapshot.foregroundPackage(snapshot, target) == pkg) return@runCatching
+                        val foreground=HuWindowSnapshot.foregroundPackage(snapshot,target)
+                        if(delay==delays.last()) SessionDiagnostics.event("HU launch placement final snapshot; package=$pkg; display=$target; onHu=${foreground==pkg}; phoneForeground=${HuWindowSnapshot.foregroundPackage(snapshot,0)==pkg}; notification=$notification")
+                        listener.onForegroundApp(foreground)
+                        if (foreground == pkg) {
+                            if(assistant && voiceFocused.compareAndSet(false,true)) {
+                                val taskId=HuWindowSnapshot.foregroundTaskId(snapshot,target)
+                                val actual=HuWindowSnapshot.foregroundComponent(snapshot,target)
+                                if(taskId!=null && launchRevision.get()==token && !closed.get() && appDisplay()==target) {
+                                    val focus=runShellCommand("am task focus $taskId")
+                                    SessionDiagnostics.event("HU assistant task focus; task=$taskId; display=$target; component=${actual?.flattenToShortString()}; success=${!shellCommandFailed(focus)}")
+                                }
+                            }
+                            report(true); return@runCatching
+                        }
                         if (HuWindowSnapshot.foregroundPackage(snapshot, 0) != pkg) return@runCatching
-                        val roots = runShellCommand("am stack list")
-                        val headers = Regex("(?m)^(?:RootTask|Stack) id=(\\d+)\\b[^\\r\\n]*").findAll(roots).toList()
-                        val root = headers.indices.firstOrNull { index ->
-                            val header = headers[index]
-                            if (!Regex("displayId=0\\b").containsMatchIn(header.value)) return@firstOrNull false
-                            val section = roots.substring(header.range.last + 1, headers.getOrNull(index+1)?.range?.first ?: roots.length)
-                            val packages = Regex("(?m)^\\s*taskId=\\d+: ([A-Za-z0-9_.]+)/").findAll(section).map { it.groupValues[1] }.toList()
-                            packages.isNotEmpty() && packages.all { it == pkg } && section.contains("topActivity=ComponentInfo{$pkg/")
-                        } ?: return@runCatching
-                        val id = headers[root].groupValues[1].toIntOrNull() ?: return@runCatching
+                        val root=ownedAppRoot(runShellCommand("am stack list"),pkg,0) ?: return@runCatching
+                        if(launchRevision.get()!=token || closed.get() || appDisplay()!=target) return@execute
+                        val id=root.rootId
                         val result = runShellCommand("am display move-stack $id $target")
                         val after = runShellCommand(HuWindowSnapshot.COMMAND)
                         val placed = HuWindowSnapshot.foregroundPackage(after, target) == pkg
                         SessionDiagnostics.event("HU launch placement repair; package=$pkg; root=$id; display=$target; success=$placed; commandFailed=${shellCommandFailed(result)}")
                         listener.onForegroundApp(HuWindowSnapshot.foregroundPackage(after, target))
-                        if (!placed && delay == 6000L) listener.onStatus("Android не позволил перенести $pkg на ГУ")
+                        if(placed) report(true)
                     }.onFailure { SessionDiagnostics.event("HU launch placement check failed: ${it.javaClass.simpleName}") }
+                    if(delay==delays.last()) report(false)
                 } } catch (_: RejectedExecutionException) { }
             }, delay, TimeUnit.MILLISECONDS)
         }
@@ -562,6 +659,7 @@ class ScrcpySource(
         try { displayCommands.execute {
             if (closed.get() || appDisplay() != target || launchRevision.get() != token) return@execute
             runCatching {
+                if (BridgeSettings.read(context).restartAliceSession && launchFreshAlice(target,token)) return@runCatching
                 var requested = false
                 for (action in listOf("android.intent.action.VOICE_COMMAND", "android.intent.action.ASSIST")) {
                     val resolved = runShellCommand("cmd package resolve-activity --brief --user current -a $action")
@@ -570,11 +668,11 @@ class ScrcpySource(
                     val component = flat?.let(ComponentName::unflattenFromString)
                     if (component == null || component.packageName in setOf("android", "com.android.intentresolver")) continue
                     configureLandscape(target)
-                    val output = runShellCommand("am start --user current --display $target -f 0x18000000 " +
+                    val output = runShellCommand("am start --user current --display $target -f 0x10000000 " +
                         "-a $action -n ${shellArgument(component.flattenToString())}")
                     if (shellCommandFailed(output)) continue
                     requested = true
-                    SessionDiagnostics.event("HU wheel assistant start requested; package=${component.packageName}; display=$target; microphone=phone; placementPending=true")
+                    SessionDiagnostics.event("HU wheel assistant start requested; component=${component.flattenToShortString()}; display=$target; launchRevision=$token; microphone=phone; placementPending=true")
                     listener.onAssistantStarted(component.packageName)
                     verifyLaunchPlacement(component.packageName, target, token, assistant = true)
                     diagnoseAssistantMicrophone(component.packageName, target)
@@ -587,6 +685,93 @@ class ScrcpySource(
                 }
             }.onFailure { listener.onAssistantFinished("launch failed"); status("Не удалось вызвать ассистента: ${it.javaClass.simpleName}") }
         } } catch (_: RejectedExecutionException) { }
+    }
+
+    /** Opt-in experiment: only a positively identified Alice task on our app display
+     * may be finished. Never remove other tasks or anything on the physical display. */
+    private fun launchFreshAlice(target: Int, token: Long): Boolean {
+        fun current() = !closed.get() && launchRevision.get()==token && appDisplay()==target
+        val alicePackages=listOf("com.yandex.searchapp","ru.yandex.searchplugin")
+        val assistantClasses=setOf("ru.yandex.searchplugin.AssistantActivity","ru.yandex.searchplugin.AssistantActivityAlias")
+        // An ASSIST intent can resolve to the ordinary browser. Prefer a voice Activity
+        // only if the installed version actually exposes it and permits this caller.
+        val explicitVoice=alicePackages.firstNotNullOfOrNull { pkg ->
+            assistantClasses.firstNotNullOfOrNull { name ->
+                val candidate=ComponentName(pkg,name)
+                @Suppress("DEPRECATION")
+                val info=runCatching { context.packageManager.getActivityInfo(candidate,0) }.getOrNull()
+                candidate.takeIf { info?.enabled==true && info.exported &&
+                    (info.permission.isNullOrBlank() || context.checkSelfPermission(info.permission)==android.content.pm.PackageManager.PERMISSION_GRANTED) }
+            }
+        }
+        val component=explicitVoice ?: alicePackages.firstNotNullOfOrNull { pkg ->
+            if(!current()) return true
+            val resolved=runShellCommand("cmd package resolve-activity --brief --user current -a android.intent.action.ASSIST -p ${shellArgument(pkg)}")
+            Regex("(?m)^([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)\\s*$").find(resolved)?.groupValues?.get(1)
+                ?.let(ComponentName::unflattenFromString)?.takeIf { it.packageName==pkg }
+        }
+        if(component==null) {
+            SessionDiagnostics.event("HU Alice session experiment unavailable; ASSIST activity not resolved; fallback=standard_assistant")
+            return false
+        }
+        if(!current()) return true
+        @Suppress("DEPRECATION")
+        val actualTarget=runCatching{context.packageManager.getActivityInfo(component,0).targetActivity}.getOrNull() ?: component.className
+        val voiceComponent=actualTarget in assistantClasses && !actualTarget.endsWith("Alias")
+        SessionDiagnostics.event("HU Alice entry point; component=${component.flattenToShortString()}; target=$actualTarget; pureVoiceCandidate=$voiceComponent; launchRevision=$token")
+        if(!voiceComponent) {
+            // Do not mistake a browser task for an isolated recorder that can be reset.
+            SessionDiagnostics.event("HU Alice fresh session unavailable; resolved component is not an isolated voice Activity; fallback=standard_assistant")
+            return false
+        }
+        stopAssistantDiagnostics()
+        val roots=runShellCommand("am stack list")
+        val existing=ownedAppRoot(roots,component.packageName,target)
+        val canFinish=existing?.topComponent?.let {
+            it.packageName==component.packageName && it.className in assistantClasses
+        } == true
+        var finished=false
+        if(canFinish && existing!=null && current()) {
+            // Re-read immediately before the mutation: a user may have changed applications.
+            val latest=ownedAppRoot(runShellCommand("am stack list"),component.packageName,target)
+            if(latest==existing && current()) {
+                val output=runShellCommand("am stack remove ${existing.rootId}")
+                val after=runShellCommand("am stack list")
+                val remains=Regex("(?m)^(?:RootTask|Stack) id=${existing.rootId}\\b").containsMatchIn(after)
+                finished=!shellCommandFailed(output) && !shellCommandFailed(after) && !remains &&
+                    Regex("(?m)^(?:RootTask|Stack) id=\\d+\\b").containsMatchIn(after)
+                SessionDiagnostics.event("HU Alice previous task finish; package=${component.packageName}; display=$target; root=${existing.rootId}; finished=$finished")
+            }
+        }
+        if(!current()) return true
+        SessionDiagnostics.event("HU Alice session requested; package=${component.packageName}; display=$target; previousTaskFinished=$finished; resetSkipped=${existing!=null && !canFinish}")
+        val start=Runnable {
+            if(!current()) return@Runnable
+            runCatching {
+                configureLandscape(target)
+                if(!current()) return@runCatching
+                val output=runShellCommand("am start --user current --display $target -f 0x10000000 " +
+                    "-a android.intent.action.ASSIST -n ${shellArgument(component.flattenToString())}")
+                if(shellCommandFailed(output)) throw IOException(output.trim().take(180))
+                if(!current()) return@runCatching
+                listener.onAssistantStarted(component.packageName)
+                SessionDiagnostics.event("HU Alice session launched; package=${component.packageName}; display=$target; action=ASSIST; previousTaskFinished=$finished; microphone=phone")
+                verifyLaunchPlacement(component.packageName,target,token,assistant=true)
+                diagnoseAssistantMicrophone(component.packageName,target)
+            }.onFailure {
+                if(current()) {
+                    listener.onAssistantFinished("Alice session launch failed")
+                    SessionDiagnostics.event("HU Alice session launch failed: ${it.javaClass.simpleName}")
+                    status("Не удалось заново открыть Алису. Выключите эксперимент «Новый сеанс Алисы» или отправьте журнал")
+                }
+            }
+        }
+        // Give Android a short chance to finish the previous Activity/recorder. This is
+        // cancellable scheduled work, not a blocking wait or a repeating restart loop.
+        if(finished) controls.schedule({
+            if(current()) try { displayCommands.execute(start) } catch(_: RejectedExecutionException) { }
+        },350L,TimeUnit.MILLISECONDS) else start.run()
+        return true
     }
 
     fun stopAssistantDiagnostics() { assistantDiagnosticRevision.incrementAndGet() }
@@ -761,7 +946,10 @@ class ScrcpySource(
                 try {
                     status(if (panelOn) "Включаю экран телефона; дисплей ГУ остаётся активным"
                         else "Гашу экран телефона; дисплей ГУ остаётся активным")
-                    val channel = keep(AdbSession.open(ScrcpyWakeupCommand.DESTINATION, 1500L)) { wakeupCommand = it }
+                    SessionDiagnostics.event("Phone wake command; isolated=$isolatedPowerCommand; mediaAdbConnected=${AdbSession.isConnected()}")
+                    val channel = keep(if (isolatedPowerCommand)
+                        AdbSession.openIsolatedLocal(context, ScrcpyWakeupCommand.DESTINATION)
+                        else AdbSession.open(ScrcpyWakeupCommand.DESTINATION, 1500L)) { wakeupCommand = it }
                     try {
                         ScrcpyWakeupCommand.awaitAcknowledgement(channel.input, 2000L) { isRecoveryCurrent(recovery) }
                     } finally {
@@ -769,6 +957,7 @@ class ScrcpySource(
                         // LibraryChannel.close() has its own one-second CLSE budget.
                         runCatching { channel.close() }
                     }
+                    SessionDiagnostics.event("Phone wake acknowledged; mediaAdbConnected=${AdbSession.isConnected()}")
                     if (isRecoveryCurrent(recovery)) scheduleRecoveryPanel(recovery, 250L, finalPass = false, complete = ::complete)
                     else complete()
                 } catch (error: Exception) {
@@ -1059,6 +1248,7 @@ class ScrcpySource(
 
     private fun fail(message: String, error: Throwable?) {
         if (closed.get() || !failed.compareAndSet(false, true)) return
+        SessionDiagnostics.event("scrcpy source failure; mediaAdbConnected=${AdbSession.isConnected()}; transportFailure=${AdbSession.transportFailure()}; error=${error?.javaClass?.simpleName}")
         Log.e(TAG, message, error)
         runCatching { listener.onError(message, error) }
         closed.set(true)
@@ -1122,6 +1312,7 @@ class ScrcpySource(
     }
 
     private fun serverCommand(remote: String, scid: String): String {
+        val cbr=constantBitrateEncoder()
         // Only validated numeric values and our generated private path enter the shell.
         val options = listOf(
             "log_level=debug", "scid=$scid", "video=true", "audio=false", "control=true",
@@ -1138,13 +1329,28 @@ class ScrcpySource(
             "video_codec_options=profile=1,i-frame-interval=${videoProfile.iFrameIntervalSeconds}," +
                 "color-standard=${MediaFormat.COLOR_STANDARD_BT709}," +
                 "color-transfer=${MediaFormat.COLOR_TRANSFER_SDR_VIDEO}," +
-                "color-range=${MediaFormat.COLOR_RANGE_LIMITED}"
-        ) + listOfNotNull(maxVideoSize?.let { "max_size=$it" })
+                "color-range=${MediaFormat.COLOR_RANGE_LIMITED}" + if(cbr!=null) ",bitrate-mode=2" else ""
+        ) + listOfNotNull(maxVideoSize?.let { "max_size=$it" },cbr?.let{"video_encoder=$it"})
         SessionDiagnostics.event("H.264 encoder color requested: standard=BT709; transfer=SDR_VIDEO; range=LIMITED; " +
             "androidValues=${MediaFormat.COLOR_STANDARD_BT709}/${MediaFormat.COLOR_TRANSFER_SDR_VIDEO}/${MediaFormat.COLOR_RANGE_LIMITED}")
         return "CLASSPATH='$remote' app_process / com.genymobile.scrcpy.Server $SERVER_VERSION " +
             options.joinToString(" ") + " 2>&1"
     }
+
+    /** Select a supported hardware CBR encoder once, before server startup. No software fallback. */
+    private fun constantBitrateEncoder():String? = runCatching {
+        val scale=maxVideoSize?.let{minOf(1.0,it.toDouble()/maxOf(width,height))} ?: 1.0
+        val w=(width*scale).toInt()/8*8;val h=(height*scale).toInt()/8*8
+        val selected=MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull{info->
+            info.isEncoder && info.isHardwareAccelerated && !info.isAlias &&
+                info.name.matches(Regex("[A-Za-z0-9_.-]+")) && info.supportedTypes.any{it.equals(MediaFormat.MIMETYPE_VIDEO_AVC,true)} &&
+                runCatching{val caps=info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                    caps.encoderCapabilities.isBitrateModeSupported(android.media.MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) &&
+                        caps.videoCapabilities.isSizeSupported(w,h)}.getOrDefault(false)
+        }?.name
+        SessionDiagnostics.event("H264 bitrate control; mode=${if(selected!=null) "hardware_CBR" else "platform_default"}; encoder=${selected ?: "default"}; targetBitrate=${videoProfile.bitRate}; maxFps=${videoProfile.maxFps}")
+        selected
+    }.getOrNull()
 
     companion object {
         const val SERVER_VERSION = "5.0.1"

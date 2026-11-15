@@ -52,6 +52,7 @@ internal class ConnectionWizard private constructor(context: Context) {
     private var connectionEpoch = 0
     @Volatile private var preparationCancelled = false
     var automaticDiscoveryChecks: Boolean = true
+    @Volatile var phonePreparationOnly: Boolean = true
     @Volatile private var discoveryPorts = ""
     private val discovery: AdbServiceDiscovery = AdbServiceDiscovery(app) {
         val pairing = discoveryEndpoints(AdbServiceDiscovery.PAIR).firstOrNull()?.port ?: 0
@@ -138,7 +139,9 @@ internal class ConnectionWizard private constructor(context: Context) {
         if (preparationCancelled) return
         if (awaitingHeadUnit) return
         if (snapshot.busy) return
+        val preparationOnly = phonePreparationOnly
         if (AppDisplayState.displayId > 0) { connected(); return }
+        if (com.example.carbridge.capture.CaptureService.hasActiveSession) return
         if (AdbSetupViewModel.isOperationBusy()) {
             publish(snapshot.copy(ready = false, message = "Дождитесь завершения операции в настройках ADB.", action = Action.RETRY))
             return
@@ -236,10 +239,14 @@ internal class ConnectionWizard private constructor(context: Context) {
                     selected != app.packageName && app.packageManager.getLaunchIntentForPackage(selected) != null
                 }, "Выберите установленное приложение, которое нужно открыть на ГУ.", Action.APP)) return@start snapshot.message
             publish(snapshot.copy(phoneReady = true))
+            if (preparationOnly) {
+                publish(snapshot.copy(ready = true, action = Action.NONE))
+                return@start "Телефон готов. Выберите способ подключения."
+            }
             val usb = app.getSystemService(UsbManager::class.java)
             val accessory = usb.accessoryList?.firstOrNull()
             if (accessory == null) return@start blocked(Step.USB,
-                "Телефон подготовлен. Подключите его кабелем передачи данных к ГУ и выберите CarLife на ГУ. При обнаружении подключения мастер продолжит автоматически.", Action.RETRY)
+                "Телефон подготовлен. Подключите кабель и выберите CarLife на ГУ. В эмуляторе Windows нажмите «Подключить». Выбор CarLife в CarBridge сохранён; при обнаружении USB мастер продолжит автоматически.", Action.RETRY)
             if (!usb.hasPermission(accessory)) return@start blocked(Step.USB,
                 "Разрешите Android передать USB-подключение CarBridge. Нажмите кнопку ниже и подтвердите системный запрос.", Action.USB_PERMISSION)
             mark(Step.USB, Mark.PASSED)

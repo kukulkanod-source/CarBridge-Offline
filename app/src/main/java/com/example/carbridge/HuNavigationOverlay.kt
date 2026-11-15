@@ -55,6 +55,8 @@ class HuNavigationOverlay(
     private val onInputKey: (Int) -> Unit,
     private val onNotificationOpen: (StatusBarNotification) -> Unit,
     private val onNavigationCueVisibility: (Boolean) -> Unit = {},
+    private val onNavigationForegroundCheck: () -> Unit = {},
+    private val onWeatherToggle: () -> Unit = {},
 ) {
     private val context = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
@@ -71,19 +73,60 @@ class HuNavigationOverlay(
     private var navigationCueNotificationKey = ""
     private var navigationCueMissingAt = 0L
     private var navigationCueSignState = ""
+    private var pendingCueKey=""
+    private var pendingCueAt=0L
+    private var pendingCueCommitAt=0L
+    private val revealCue=Runnable { renderNavigationCue() }
+    private var expectedForeground: String?=null
+    private var expectedUntil=0L
+    private val finishExpectedForeground=Runnable {
+        expectedForeground=null; expectedUntil=0L
+        onNavigationForegroundCheck()
+    }
+    fun expectForegroundPackage(pkg: String) {
+        expectedForeground=pkg; expectedUntil=android.os.SystemClock.elapsedRealtime()+2500L
+        main.removeCallbacks(finishExpectedForeground); main.postDelayed(finishExpectedForeground,2500L)
+    }
+    fun cancelExpectedForeground(pkg: String) {
+        if(expectedForeground!=pkg) return
+        expectedForeground=null; expectedUntil=0L; main.removeCallbacks(finishExpectedForeground)
+        renderDock(); renderNavigationCue(); onNavigationForegroundCheck()
+    }
+    private fun cancelPendingCue() {
+        main.removeCallbacks(revealCue); pendingCueKey=""; pendingCueAt=0L; pendingCueCommitAt=0L
+    }
     private var cueVisible = false
+    private var cueHidden=context.getSharedPreferences("navigation_cue",0).getBoolean("hidden",false)
+    private var cueButton: ImageView?=null
+    private fun setCueHidden(hidden: Boolean) {
+        cueHidden=hidden
+        context.getSharedPreferences("navigation_cue",0).edit().putBoolean("hidden",hidden).apply()
+        updateCueButton()
+        renderNavigationCue()
+    }
+    private fun updateCueButton() {
+        cueButton?.apply {
+            alpha=if(cueHidden) 0.5f else 1f
+            contentDescription=if(cueHidden) "Показать подсказки навигации" else "Скрыть подсказки навигации"
+        }
+    }
     private var navigationOnRight = true
     private var navigationCardHeight = 0
     private var navigationCardInset = 0
+    private var navigationCardTop = 0
+    fun hideNavigationCard() { setCueHidden(true) }
+    private var weatherButton: ImageView?=null
+    fun setWeatherVisible(visible: Boolean) { weatherButton?.alpha=if(visible) 1f else 0.6f }
     fun isNavigationCueVisible(): Boolean = cueVisible
     private fun publishCueVisibility(visible: Boolean) {
         if(cueVisible==visible) return
         cueVisible=visible
         onNavigationCueVisibility(visible)
     }
-    fun setNavigationCardPlacement(right: Boolean, cardHeight: Int, inset: Int) {
+    fun setNavigationCardPlacement(right: Boolean, cardHeight: Int, inset: Int, top: Int=inset) {
+        navigationCardTop=top
         navigationOnRight=right; navigationCardHeight=cardHeight; navigationCardInset=inset
-        navigationCue?.setPlacement(right,cardHeight,inset)
+        navigationCue?.setPlacement(right,cardHeight,inset,top)
         banner?.let { card ->
             val params=card.layoutParams as? WindowManager.LayoutParams ?: return@let
             val gravity=Gravity.TOP or if(right) Gravity.START else Gravity.END
@@ -108,6 +151,7 @@ class HuNavigationOverlay(
     private var displayId = -1
     private var density = 1f
     private var barHeight = 0
+    private var dockIconSize = 1
     private var width = 0
     private var height = 0
     private var registered = false
@@ -134,6 +178,7 @@ class HuNavigationOverlay(
                 }) }
             }
             handle?.visibility = View.VISIBLE
+            inspectDock("auto hide")
         }
     }
     private fun holdDock() {
@@ -145,9 +190,44 @@ class HuNavigationOverlay(
                 runCatching { manager?.updateViewLayout(root, layout(width, barHeight, Gravity.BOTTOM)) }
             }
             handle?.visibility = View.GONE
+            inspectDock("user reveal")
         }
         main.removeCallbacks(hideDock)
         main.postDelayed(hideDock, 6000)
+    }
+    private var dockState=""
+    private var dockStateAt=0L
+    private var inspectingDock=false
+    private fun inspectDock(reason: String) {
+        val root=view ?: return
+        if(inspectingDock) return
+        inspectingDock=true
+        try {
+            val params=root.layoutParams as? WindowManager.LayoutParams
+            if(!autoHide && root.isAttachedToWindow && params!=null) {
+                val wrongWindow=params.width!=width || params.height!=barHeight || params.gravity!=Gravity.BOTTOM ||
+                    params.x!=0 || params.y!=0 || (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)!=0
+                val wrongView=root.visibility!=View.VISIBLE || root.alpha<0.99f || root.translationY!=0f
+                if(wrongWindow || wrongView) {
+                    SessionDiagnostics.event("HU permanent dock restore requested; reason=$reason; viewWrong=$wrongView; windowWrong=$wrongWindow")
+                    root.visibility=View.VISIBLE; root.alpha=1f; root.translationY=0f; dockHidden=false
+                    runCatching { manager?.updateViewLayout(root,layout(width,barHeight,Gravity.BOTTOM)) }
+                        .onFailure { SessionDiagnostics.event("HU permanent dock restore failed: ${it.javaClass.simpleName}") }
+                }
+            }
+            val position=IntArray(2)
+            root.getLocationOnScreen(position)
+            val actual=root.layoutParams as? WindowManager.LayoutParams
+            val state="display=$displayId; autoHide=$autoHide; hidden=$dockHidden; attached=${root.isAttachedToWindow}; " +
+                "view=${root.visibility}; window=${root.windowVisibility}; shown=${root.isShown}; alpha=${root.alpha}; " +
+                "bounds=${position[0]},${position[1]},${root.width},${root.height}; " +
+                "requested=${actual?.width}x${actual?.height}; gravity=${actual?.gravity}; flags=${actual?.flags}"
+            val now=android.os.SystemClock.elapsedRealtime()
+            if(state!=dockState || now-dockStateAt>=30000L) {
+                dockState=state; dockStateAt=now
+                SessionDiagnostics.event("HU dock state; reason=$reason; $state")
+            }
+        } finally { inspectingDock=false }
     }
     private val hideBanner = Runnable { removeBanner() }
     private val update = object : Runnable {
@@ -156,6 +236,7 @@ class HuNavigationOverlay(
             renderStatus()
             renderDock()
             renderNavigationCue()
+            inspectDock("periodic")
             main.postDelayed(this, 5000)
         }
     }
@@ -177,6 +258,7 @@ class HuNavigationOverlay(
             if (!strelka && HuNotificationContent.isNavigation(item, HuNotificationContent.read(windowContext ?: context,item))) return
             if (strelka) {
                 val content = HuNotificationContent.read(windowContext ?: context,item)
+                if(content.title.isBlank() && content.text.isBlank() && content.navigationHints.isBlank() && content.icon==null) return
                 val signature = "${content.title}:${content.text}"
                 val now = android.os.SystemClock.elapsedRealtime()
                 if ((signature == alertSignature && now - alertAt < 15000) || now - alertAt < 2000) return
@@ -209,10 +291,19 @@ class HuNavigationOverlay(
             // Keep room for controls, the app dock, and the clock even on small head units.
             density = (interfaceDpi.coerceIn(80, 320) / 160f * scale).coerceAtMost(width / 700f)
             barHeight = px(HuDockDimensions.HEIGHT_DP)
+            dockIconSize = px(24).coerceAtLeast(1)
             val root = object : LinearLayout(wc) {
                 override fun dispatchTouchEvent(event: MotionEvent): Boolean {
                     if (event.actionMasked == MotionEvent.ACTION_DOWN) holdDock()
                     return super.dispatchTouchEvent(event)
+                }
+                override fun onWindowVisibilityChanged(visibility: Int) {
+                    super.onWindowVisibilityChanged(visibility)
+                    if(this===view) inspectDock("window visibility=$visibility")
+                }
+                override fun onDetachedFromWindow() {
+                    if(this===view) SessionDiagnostics.event("HU dock window detached; display=$displayId; autoHide=$autoHide")
+                    super.onDetachedFromWindow()
                 }
             }.apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -230,11 +321,13 @@ class HuNavigationOverlay(
             fun divider() { root.addView(View(wc).apply { setBackgroundColor(Color.rgb(68, 88, 110)) },
                 LinearLayout.LayoutParams(px(1), -1).apply { setMargins(px(3), px(4), px(3), px(4)) }) }
             val controls = section()
+            controls.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                updateControlIcons(controls)
+            }
             fun control(kind: String, description: String, action: () -> Unit): ImageView =
                 ImageView(wc).apply {
                     contentDescription = description
-                    scaleType = ImageView.ScaleType.CENTER_INSIDE
-                    setPadding(px(8), px(4), px(8), px(4))
+                    scaleType = ImageView.ScaleType.FIT_CENTER
                     setImageDrawable(HuPanelIcons.drawable(context, kind))
                     setOnClickListener { action() }
                 }.also { controls.addView(it, LinearLayout.LayoutParams(0, -1, 1f)) }
@@ -243,6 +336,10 @@ class HuNavigationOverlay(
             control("apps", "Все приложения", onApps)
             control("favorites", "Избранные приложения") { favorites?.open() }
             mediaButton = control("music", "Музыка / карта", onMediaToggle)
+            cueButton = control("location", "Подсказки навигации") { setCueHidden(!cueHidden) }
+            updateCueButton()
+            weatherButton=control("weather", "Погода",onWeatherToggle)
+            setWeatherVisible(false)
             phoneButton = control("phone_off", "Экран телефона") {
                 if (phoneVisible) onPhoneDim() else onPhoneWake()
             }
@@ -273,15 +370,15 @@ class HuNavigationOverlay(
                 setOnClickListener { toggleShade() }
             }.also { statusGroup.addView(it, LinearLayout.LayoutParams(-2, -1)) }
             batteryIcon = ImageView(wc).apply {
-                scaleType = ImageView.ScaleType.CENTER_INSIDE
-                setPadding(px(2), px(3), px(2), px(3))
+                scaleType = ImageView.ScaleType.FIT_CENTER
                 setOnClickListener { toggleShade() }
-            }.also { statusGroup.addView(it, LinearLayout.LayoutParams(px(26), px(24))) }
+            }.also { statusGroup.addView(it, LinearLayout.LayoutParams(dockIconSize,dockIconSize)) }
             statusButton = button("", "Подключения, уведомления и быстрые настройки") { toggleShade() }
                 .apply { setTextSize(TypedValue.COMPLEX_UNIT_PX, 13f * density); maxLines = 1 }
                 .also { statusGroup.addView(it, LinearLayout.LayoutParams(px(76), -1)) }
             wm.addView(root, layout(width, barHeight, Gravity.BOTTOM))
             view = root
+            root.post { if(view===root) updateControlIcons(controls) }
             favorites = HuFavoritesPanel(wc, wm, width, height, barHeight, density, onLaunch, { dismissApplications() })
             if (autoHide) {
                 val edge = View(wc).apply {
@@ -310,7 +407,7 @@ class HuNavigationOverlay(
             main.post {
                 if (displayId == id && view != null) notifications.onReceive(context, null)
             }
-            SessionDiagnostics.event("HU bottom dock attached; display=$id; height=$barHeight")
+            SessionDiagnostics.event("HU bottom dock attached; display=$id; height=$barHeight; autoHide=$autoHide")
             true
         } catch (e: Exception) {
             SessionDiagnostics.event("HU bottom dock unavailable: ${e.javaClass.simpleName}: ${e.message}")
@@ -344,14 +441,41 @@ class HuNavigationOverlay(
         PixelFormat.TRANSLUCENT,
     ).apply { gravity = gravityValue; title = "CarBridge HU dock" }
 
+    /** Fit artwork to the actual control cells, not DPI-sized padding in a fixed third.
+     * All three sections share the resulting glyph size; touch targets keep their full cells. */
+    private fun updateControlIcons(controls: LinearLayout) {
+        if(controls.width<=0 || controls.height<=0 || controls.childCount==0) return
+        val cellWidth=(0 until controls.childCount).map { controls.getChildAt(it).width }
+            .filter { it>0 }.minOrNull() ?: return
+        val size=minOf(px(24), (cellWidth*0.82f).roundToInt(),
+            (controls.height*0.8f).roundToInt()).coerceAtLeast(1)
+        for(index in 0 until controls.childCount) {
+            val icon=controls.getChildAt(index) as? ImageView ?: continue
+            val horizontal=(icon.width-size).coerceAtLeast(0)
+            val vertical=(icon.height-size).coerceAtLeast(0)
+            val left=horizontal/2; val top=vertical/2
+            if(icon.paddingLeft!=left || icon.paddingTop!=top ||
+                icon.paddingRight!=horizontal-left || icon.paddingBottom!=vertical-top) {
+                icon.setPadding(left,top,horizontal-left,vertical-top)
+            }
+        }
+        if(dockIconSize==size) return
+        dockIconSize=size
+        batteryIcon?.layoutParams=LinearLayout.LayoutParams(size,size)
+        renderDock()
+        renderStatus()
+        SessionDiagnostics.event("HU dock icon geometry; display=$displayId; barHeight=$barHeight; controlCell=$cellWidth; glyphSize=$size")
+    }
+
     private fun renderDock() {
         val target = dock ?: return
         val recent = HuLauncherStore.recent(context)
-        val key = recent.joinToString() + activePackage + target.width
+        val key = recent.joinToString() + activePackage + target.width + ":$dockIconSize"
         if (historyKey == key) return
         historyKey = key
         target.removeAllViews()
-        val maxIcons = (target.width / px(48).coerceAtLeast(1)).coerceIn(0, 8)
+        val slotWidth=(dockIconSize*2).coerceAtLeast(1)
+        val maxIcons = (target.width / slotWidth).coerceIn(0, 8)
         val shown = (listOfNotNull(activePackage) + recent).distinct().filter { it != context.packageName }.take(maxIcons)
         shown.forEach { pkg ->
             val icon = runCatching { context.packageManager.getApplicationIcon(pkg) }.getOrNull() ?: return@forEach
@@ -362,19 +486,28 @@ class HuNavigationOverlay(
                 setOnClickListener { dismissApplications(); onLaunch(pkg) }
                 setOnLongClickListener { showAppMenu(pkg, name, it); true }
             }
-            cell.addView(ImageView(windowContext!!).apply { setImageDrawable(icon) }, LinearLayout.LayoutParams(px(24), px(24)))
+            cell.addView(ImageView(windowContext!!).apply {
+                scaleType=ImageView.ScaleType.FIT_CENTER
+                setImageDrawable(icon)
+            }, LinearLayout.LayoutParams(dockIconSize,dockIconSize))
             cell.addView(View(windowContext!!).apply {
                 background = android.graphics.drawable.GradientDrawable().apply {
                     shape = android.graphics.drawable.GradientDrawable.OVAL
                     setColor(if (pkg == activePackage) Color.rgb(117, 199, 255) else Color.GRAY)
                 }
             }, LinearLayout.LayoutParams(px(3), px(3)).apply { topMargin = px(2) })
-            target.addView(cell, LinearLayout.LayoutParams(px(48), -1))
+            target.addView(cell, LinearLayout.LayoutParams(slotWidth, -1))
         }
     }
 
+    // Only a display snapshot (or our visible home Presentation) can commit this state.
+    // Sending an Intent must not reveal/reorder navigation widgets by itself.
     fun setForegroundPackage(pkg: String?) {
+        if (pkg != null && pkg == expectedForeground) {
+            expectedForeground=null; expectedUntil=0L; main.removeCallbacks(finishExpectedForeground)
+        }
         activePackage = pkg
+        HuGuidanceSource.foreground(pkg)
         if(pkg!=null) navigationForegroundPackage=pkg
         renderDock()
         renderNavigationCue()
@@ -438,10 +571,9 @@ class HuNavigationOverlay(
             row.removeAllViews()
             fun add(kind: String, description: String) {
                 row.addView(ImageView(windowContext!!).apply {
-                    scaleType = ImageView.ScaleType.CENTER_INSIDE
+                    scaleType = ImageView.ScaleType.FIT_CENTER
                     setImageDrawable(HuPanelIcons.drawable(context, kind)); contentDescription = description
-                    setPadding(px(2), px(2), px(2), px(2))
-                }, LinearLayout.LayoutParams(px(24), px(24)))
+                }, LinearLayout.LayoutParams(dockIconSize,dockIconSize).apply { marginStart=px(2) })
             }
             if (caps.any { it.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) }) add("wifi", "Wi-Fi подключён")
             if (bt) add("bluetooth", "Bluetooth включён")
@@ -477,19 +609,19 @@ class HuNavigationOverlay(
             .distinctBy { it.packageName }
         // Connectivity, battery and clock reserve their natural width. Notifications grow
         // leftwards into the remaining space of this section, never into the app dock.
-        val slotWidth = px(22).coerceAtLeast(1)
+        val slotWidth = (dockIconSize+px(2)).coerceAtLeast(1)
         val capacity = (icons.width / slotWidth).coerceAtLeast(0)
         val overflow = notices.size > capacity
         val shownCount = if (overflow) (capacity - 1).coerceAtLeast(0) else notices.size
         notices.take(shownCount).forEach { item ->
             val icon = ImageView(windowContext!!).apply {
-                scaleType = ImageView.ScaleType.CENTER_INSIDE
-                setPadding(px(1), px(1), px(1), px(1))
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setPadding(0,0,px(2),0)
                 setImageDrawable(runCatching { context.packageManager.getApplicationIcon(item.packageName) }.getOrNull())
                 contentDescription = "Уведомления ${item.packageName}"
                 setOnClickListener { toggleShade() }
             }
-            icons.addView(icon, LinearLayout.LayoutParams(slotWidth, px(23)))
+            icons.addView(icon, LinearLayout.LayoutParams(slotWidth,dockIconSize))
         }
         if (overflow && capacity > 0) {
             val remaining = notices.size - shownCount
@@ -498,7 +630,7 @@ class HuNavigationOverlay(
                 setPadding(0, 0, 0, 0)
                 contentDescription = "Ещё $remaining приложений с уведомлениями"
                 setOnClickListener { toggleShade() }
-            }, LinearLayout.LayoutParams(slotWidth, px(23)))
+            }, LinearLayout.LayoutParams(slotWidth,dockIconSize))
         }
     }
 
@@ -708,14 +840,21 @@ class HuNavigationOverlay(
     }
 
     private fun renderNavigationCue(allowGrace: Boolean = true) {
+        if(cueHidden) {
+            cancelPendingCue()
+            main.removeCallbacks(finishMissingNavigation); navigationCueMissingAt=0L
+            navigationCue?.hide(); publishCueVisibility(false)
+            return
+        }
         val wc=windowContext ?: return
         val wm=manager ?: return
         val foreground=navigationForegroundPackage ?: return
-        val items=visibleNotifications().filter {
+        val items=HuGuidanceSource.filter(visibleNotifications().filter {
             HuNotificationContent.isNavigation(it,HuNotificationContent.read(wc,it))
-        }
+        })
         // A visible map owns its own prompts; hide our compact card immediately.
         if(items.any { it.packageName==foreground }) {
+            cancelPendingCue()
             main.removeCallbacks(finishMissingNavigation); navigationCueMissingAt=0L
             navigationCue?.hide(); navigationCueNotificationKey=""
             publishCueVisibility(false)
@@ -723,6 +862,7 @@ class HuNavigationOverlay(
         }
         val candidate=items.firstOrNull { it.key==navigationCueNotificationKey } ?: items.firstOrNull()
         if(candidate==null) {
+            cancelPendingCue()
             if(navigationCue?.visible==true && allowGrace) {
                 val now=android.os.SystemClock.elapsedRealtime()
                 if(navigationCueMissingAt==0L) {
@@ -736,16 +876,47 @@ class HuNavigationOverlay(
             publishCueVisibility(false)
             return
         }
+        // Do not resize for a transient notification while the navigator is coming to the front.
+        if(!cueVisible) {
+            val now=android.os.SystemClock.elapsedRealtime()
+            if(pendingCueKey!=candidate.key) {
+                cancelPendingCue(); pendingCueKey=candidate.key; pendingCueAt=now
+                onNavigationForegroundCheck()
+            }
+            val remaining=650L-(now-pendingCueAt)
+            if(remaining>0L) {
+                main.removeCallbacks(revealCue); main.postDelayed(revealCue,remaining)
+                return
+            }
+            // Re-sample after the settling period too: the first snapshot may precede
+            // an external intent bringing the navigator to the front.
+            if(pendingCueCommitAt==0L) {
+                pendingCueCommitAt=now+150L
+                onNavigationForegroundCheck()
+            }
+            val verifyRemaining=pendingCueCommitAt-now
+            if(verifyRemaining>0L) {
+                main.removeCallbacks(revealCue); main.postDelayed(revealCue,verifyRemaining)
+                return
+            }
+        }
         main.removeCallbacks(finishMissingNavigation); navigationCueMissingAt=0L
         val content=HuNotificationContent.read(wc,candidate)
-        val card=navigationCue ?: HuNavigationCue(wc,wm,width,density,resizeForMusic) { openNotification(it) }
+        val card=navigationCue ?: HuNavigationCue(wc,wm,width,density,resizeForMusic,
+            onHide={ setCueHidden(true) },open={ item ->
+                dismissApplications()
+                SessionDiagnostics.event("HU navigation card app launch requested; package=${item.packageName}; overlayDisplay=$displayId; method=explicit_application_launch")
+                onLaunch(item.packageName)
+            })
             .also { navigationCue=it }
         val geometry=HuTopCardLayout(width,density,resizeForMusic)
         card.setPlacement(navigationOnRight,
             navigationCardHeight.takeIf { it>0 } ?: geometry.navigationHeight,
-            navigationCardInset.takeIf { navigationCardHeight>0 } ?: geometry.inset)
+            navigationCardInset.takeIf { navigationCardHeight>0 } ?: geometry.inset,
+            navigationCardTop.takeIf { navigationCardHeight>0 } ?: geometry.inset)
         card.show(candidate,content)
         publishCueVisibility(card.visible)
+        cancelPendingCue()
         navigationCueNotificationKey=candidate.key
         val sceneContent=HuNavigationSceneContent.read(content)
         val signState="${candidate.packageName}:${content.roadSign!=null}:${content.speedLimitKmh!=null}:${content.graphicRole}:${sceneContent.turn}"
@@ -809,6 +980,10 @@ class HuNavigationOverlay(
         shade = null; shadeBody = null; shadeVersion = ""
     }
     fun close() {
+        if(view!=null) SessionDiagnostics.event("HU dock close; display=$displayId; autoHide=$autoHide; hidden=$dockHidden")
+        cancelPendingCue()
+        main.removeCallbacks(finishExpectedForeground); expectedForeground=null; expectedUntil=0L
+        dockState=""; dockStateAt=0L
         main.removeCallbacks(update)
         main.removeCallbacks(hideDock)
         handle?.let { runCatching { manager?.removeViewImmediate(it) } }; handle = null
@@ -825,7 +1000,7 @@ class HuNavigationOverlay(
         navigationCardHeight=0; navigationCardInset=0
         navigationCueMissingAt=0L; navigationCueSignState=""
         view = null; manager = null; windowContext = null; displayId = -1
-        dock = null; phoneButton = null; mediaButton = null; statusButton = null; batteryIcon = null; notificationIcons = null
+        dock = null; phoneButton = null; mediaButton = null; cueButton=null; weatherButton=null; statusButton = null; batteryIcon = null; notificationIcons = null
         connectionIcons = null
         activePackage = null; navigationForegroundPackage=null
         historyKey = ""

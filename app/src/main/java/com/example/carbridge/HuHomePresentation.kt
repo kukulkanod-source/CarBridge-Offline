@@ -42,10 +42,12 @@ class HuHomePresentation(
     private var content: LinearLayout? = null
     private var musicVisible = false
     private var musicOnRight = true
-    fun setMusicLayout(visible: Boolean, onRight: Boolean) {
+    private var sidebarFraction=0.30f
+    fun setMusicLayout(visible: Boolean, onRight: Boolean, fraction: Float=0.30f) {
         musicVisible = visible; musicOnRight = onRight
+        sidebarFraction=fraction.coerceIn(0.1f,0.5f)
         val width = context.resources.displayMetrics.widthPixels
-        val available = if (visible) (width * 0.70f).toInt() else width
+        val available = if (visible) width-Math.round(width*sidebarFraction) else width
         val inset = if (reserveDock) px(HuDockDimensions.HEIGHT_DP) else 0
         val height = (context.resources.displayMetrics.heightPixels - inset).coerceAtLeast(1)
         content?.layoutParams = android.widget.FrameLayout.LayoutParams(available, height).apply {
@@ -86,7 +88,7 @@ class HuHomePresentation(
         val frame = android.widget.FrameLayout(context)
         frame.addView(root, android.widget.FrameLayout.LayoutParams(width, -1))
         setContentView(frame)
-        setMusicLayout(musicVisible, musicOnRight)
+        setMusicLayout(musicVisible, musicOnRight, sidebarFraction)
         val token = ++revision
         HuAppCatalog.load(context) { catalog ->
             if (revision != token || !isShowing) return@load

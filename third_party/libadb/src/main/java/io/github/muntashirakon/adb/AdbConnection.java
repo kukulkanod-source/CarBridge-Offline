@@ -661,6 +661,14 @@ public class AdbConnection implements Closeable {
         mConnectionThread.interrupt();
     }
 
+    /** No packet contents or endpoint credentials; safe for the session journal. */
+    public String getLastConnectionFailure() {
+        Exception error = mConnectionException;
+        if (error == null) return "none";
+        String message = String.valueOf(error.getMessage()).replace('\n', ' ').replace('\r', ' ');
+        return error.getClass().getSimpleName() + ": " + message.substring(0, Math.min(180, message.length()));
+    }
+
     void sendPacket(byte[] packet, long timeoutMillis) throws IOException {
         runSocketWrite(timeoutMillis, () -> {
             OutputStream os = getOutputStream();

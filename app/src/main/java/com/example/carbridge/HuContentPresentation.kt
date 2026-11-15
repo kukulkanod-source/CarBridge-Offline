@@ -28,6 +28,7 @@ class HuContentPresentation(outer: Context, display: Display,
     private var contentFrame: FrameLayout? = null
     private var musicVisible = false
     private var musicOnRight = true
+    private var sidebarFraction=0.30f
     private var fullWidth = 0
     private var contentHeight = 0
     private var targetWidth = 0
@@ -35,9 +36,10 @@ class HuContentPresentation(outer: Context, display: Display,
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private val resizeTask = Runnable { applyMusicLayout() }
 
-    fun setMusicLayout(visible: Boolean, onRight: Boolean) {
+    fun setMusicLayout(visible: Boolean, onRight: Boolean, fraction: Float=0.30f) {
         musicVisible = visible
         musicOnRight = onRight
+        sidebarFraction=fraction.coerceIn(0.1f,0.5f)
         handler.removeCallbacks(resizeTask)
         if (!disposed) handler.postDelayed(resizeTask, 120)
     }
@@ -45,7 +47,7 @@ class HuContentPresentation(outer: Context, display: Display,
     private fun applyMusicLayout() {
         val surface = surfaceView ?: return
         if (disposed) return
-        val width = if (musicVisible) (fullWidth * 0.70f).toInt() else fullWidth
+        val width = if (musicVisible) fullWidth-Math.round(fullWidth*sidebarFraction) else fullWidth
         val left = if (musicVisible && !musicOnRight) fullWidth - width else 0
         if (targetWidth != width) {
             surfaceReady = false
@@ -99,10 +101,11 @@ class HuContentPresentation(outer: Context, display: Display,
                     val existing = virtual
                     if (existing != null) { existing.surface = holder.surface; return }
                     val dm = context.getSystemService(DisplayManager::class.java)
-                    val vd = dm.createVirtualDisplay("CarBridge application", targetWidth, contentHeight, appDpi, holder.surface,
-                        DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY)
+                    val flags=DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                    val vd = dm.createVirtualDisplay("CarBridge application", targetWidth, contentHeight, appDpi, holder.surface,flags)
                         ?: error("Android не создал область приложения")
                     virtual = vd
+                    SessionDiagnostics.event("HU application render refresh; system default; actual=${vd.display.refreshRate}; paced=false")
                     val id = vd.display.displayId
                     val controller = ScrcpyInputSession(context.applicationContext, id, targetWidth, contentHeight, onFailure)
                     input = controller

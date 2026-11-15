@@ -38,9 +38,9 @@ internal class HuCarLifeNavigation(private val context: Context) {
         if (!enabled) { clear(link, "disabled"); return }
         val now = SystemClock.elapsedRealtime()
         val published = HuMediaNotificationListener.snapshot().filter { it.packageName in HuNotificationContent.navigationPackages }
-        val candidates = HuMediaNotificationListener.navigationSnapshot().filter {
+        val candidates = HuGuidanceSource.filter(HuMediaNotificationListener.navigationSnapshot().filter {
             it.isOngoing || it.notification.category == Notification.CATEGORY_NAVIGATION
-        }
+        })
         if (candidates.isEmpty()) HuMediaNotificationListener.requestSnapshotRefresh()
         var parsed = Parsed(null, if (HuMediaNotificationListener.connected) "no navigation notification" else "listener disconnected")
         var guidanceEvidence = false

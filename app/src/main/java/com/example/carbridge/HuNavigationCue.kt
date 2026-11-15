@@ -13,11 +13,13 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.Button
 import kotlin.math.roundToInt
 
 /** A stable window: notification refreshes only replace its displayed content. */
 internal class HuNavigationCue(private val context: Context, private val wm: WindowManager,
     private val width: Int, private val density: Float, resizeForMusic: Boolean,
+    private val onHide: () -> Unit,
     private val open: (StatusBarNotification) -> Unit) {
     private var root: FrameLayout? = null
     private var scene: HuNavigationSceneView? = null
@@ -26,6 +28,7 @@ internal class HuNavigationCue(private val context: Context, private val wm: Win
     private var signImage: ImageView? = null
     private var speed: TextView? = null
     private var signContainer: FrameLayout? = null
+    private var hideButton: Button?=null
     private var current: StatusBarNotification? = null
     private var boundContent: HuNotificationContent.Content? = null
     private var layout: WindowManager.LayoutParams? = null
@@ -36,12 +39,15 @@ internal class HuNavigationCue(private val context: Context, private val wm: Win
     private var onRight = false
     private var cardHeight = geometry.navigationHeight
     private var cardInset = geometry.inset
-    fun setPlacement(right: Boolean, height: Int, inset: Int) {
-        if(onRight==right && cardHeight==height && cardInset==inset) return
+    private var cardTop = geometry.inset
+    fun setPlacement(right: Boolean, height: Int, inset: Int, top: Int=inset) {
+        if(onRight==right && cardHeight==height && cardInset==inset && cardTop==top) return
+        cardTop=top.coerceAtLeast(0)
         onRight=right; cardHeight=height.coerceAtLeast(1); cardInset=inset.coerceAtLeast(0)
+        root?.let(::styleCard)
         val params=layout ?: return
         params.gravity=Gravity.TOP or if(onRight) Gravity.END else Gravity.START
-        params.height=cardHeight; params.x=cardInset; params.y=cardInset
+        params.height=cardHeight; params.x=cardInset; params.y=cardTop
         root?.let { runCatching { wm.updateViewLayout(it,params) } }
     }
     private fun label(size: Float)=TextView(context).apply {
@@ -92,7 +98,45 @@ internal class HuNavigationCue(private val context: Context, private val wm: Win
         card.addView(sign,FrameLayout.LayoutParams(px(42),px(42),Gravity.TOP or Gravity.END).apply {
             topMargin=px(6); rightMargin=px(6)
         })
+        hideButton=Button(context).apply {
+            text="×"; contentDescription="Скрыть подсказки навигации"
+            setTextColor(Color.WHITE); setPadding(0,0,0,0); minWidth=0; minimumWidth=0; minHeight=0; minimumHeight=0
+            background=GradientDrawable().apply { setColor(Color.argb(100,10,20,30)); cornerRadius=geometry.radius }
+            setOnClickListener { onHide() }
+        }
+        card.addView(hideButton,FrameLayout.LayoutParams(px(40),px(40),Gravity.TOP or Gravity.START))
+        styleCard(card)
         return card
+    }
+    private fun styleCard(card: FrameLayout) {
+        val factor=(cardHeight/(320f*density)).coerceIn(0.75f,1.45f)
+        fun size(n: Int)=(n*density*factor).roundToInt().coerceAtLeast(1)
+        scene?.layoutParams=FrameLayout.LayoutParams(-1,-1).apply {
+            topMargin=size(40); bottomMargin=size(36); leftMargin=px(8); rightMargin=px(8)
+        }
+        title?.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_PX,28f*density*factor)
+            layoutParams=FrameLayout.LayoutParams(-1,size(36),Gravity.TOP).apply {
+                topMargin=size(4); leftMargin=size(50); rightMargin=size(50)
+            }
+        }
+        detail?.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_PX,13f*density*factor)
+            layoutParams=FrameLayout.LayoutParams(-1,size(32),Gravity.BOTTOM).apply {
+                bottomMargin=size(4); leftMargin=size(10); rightMargin=size(10)
+            }
+        }
+        signContainer?.layoutParams=FrameLayout.LayoutParams(size(42),size(42),Gravity.TOP or Gravity.END).apply {
+            topMargin=size(6); rightMargin=size(6)
+        }
+        speed?.setTextSize(TypedValue.COMPLEX_UNIT_PX,20f*density*factor)
+        hideButton?.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_PX,28f*density*factor)
+            layoutParams=FrameLayout.LayoutParams(size(40),size(40),Gravity.TOP or Gravity.START).apply {
+                topMargin=size(4); leftMargin=size(4)
+            }
+        }
+        card.requestLayout()
     }
     fun show(item: StatusBarNotification, content: HuNotificationContent.Content) {
         current=item
@@ -106,7 +150,8 @@ internal class HuNavigationCue(private val context: Context, private val wm: Win
         fun copy(icon: android.graphics.drawable.Drawable?)=icon?.constantState?.newDrawable(context.resources)?.mutate() ?: icon
         val icon=content.icon ?: runCatching { item.notification.smallIcon?.loadDrawable(context) }.getOrNull()
         val presentation=HuNavigationSceneContent.read(content)
-        scene?.bind(copy(icon))
+        // Some navigators expose the manoeuvre image without semantic labels or turn text.
+        scene?.bind(copy(icon),content.graphicRole!="camera")
         val heading=presentation.distance ?: content.title
         title?.let { if(it.text.toString()!=heading) it.text=heading }
         val caption=(listOf(content.title.takeUnless { it==heading }.orEmpty())+content.text.lines())
@@ -122,12 +167,12 @@ internal class HuNavigationCue(private val context: Context, private val wm: Win
         card.contentDescription="Навигационная подсказка: ${content.title} ${content.text}" +
             (limit?.let { ". Ограничение скорости $it км/ч" } ?: "")
         if(root==null) {
-            val params=WindowManager.LayoutParams(geometry.navigationWidth,cardHeight,
+            val params=WindowManager.LayoutParams((geometry.navigationWidth-cardInset*2).coerceAtLeast(1),cardHeight,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT).apply {
                     gravity=Gravity.TOP or if(onRight) Gravity.END else Gravity.START
-                    x=cardInset; y=cardInset; title="CarBridge navigation cue"
+                    x=cardInset; y=cardTop; title="CarBridge navigation cue"
                 }
             try { wm.addView(card,params); root=card; layout=params }
             catch(error: Exception) { SessionDiagnostics.event("HU navigation cue unavailable: ${error.javaClass.simpleName}"); return }
